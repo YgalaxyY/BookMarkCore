@@ -36,12 +36,12 @@ FILE_PATH = "index.html"
 
 # --- SYSTEM CHECK ---
 if not all([TG_TOKEN, GITHUB_TOKEN, HF_TOKEN]):
-    safe_log("⚠️ Внимание: Не все токены найдены в .env (это нормально для облака)")
+    safe_log("⚠️ Внимание: Не все токены найдены в .env")
 
 # --- FSM STATES ---
 class ToolForm(StatesGroup):
     wait_link = State()
-    confirm_duplicate = State()  # <--- НОВОЕ СОСТОЯНИЕ: Подтверждение дубликата
+    confirm_duplicate = State()
 
 # --- INITIALIZATION ---
 bot = Bot(token=TG_TOKEN)
@@ -53,20 +53,24 @@ gh = Github(auth=auth)
 # --- HELPER FUNCTIONS ---
 
 def extract_url_from_text(text):
-    """Ищет самую релевантную ссылку, игнорируя Telegram"""
-    urls = re.findall(r'(https?://[^\s<>"]+|www\.[^\s<>"]+)', text)
+    """
+    Улучшенный поиск ссылок.
+    Видит ссылки в скобках (link), [link], и прилипшие к знакам препинания.
+    """
+    # Regex ищет http/https, исключая скобки, кавычки и пробелы на концах
+    urls = re.findall(r'(https?://[^\s<>")\]]+|www\.[^\s<>")\]]+)', text)
     clean_urls = []
     for u in urls:
+        # Убираем лишние точки и запятые на конце, если прилипли
         u = u.rstrip(').,;]')
         if "t.me" not in u and "telegram.me" not in u:
             clean_urls.append(u)
     return clean_urls[0] if clean_urls else "MISSING"
 
 def clean_and_parse_json(raw_response):
-    """Надежный парсер JSON (с поддержкой single quotes)"""
+    """Парсер JSON с поддержкой Python dict"""
     text_to_parse = raw_response.strip()
     
-    # 1. Попытка найти блок кода ```json ... ```
     json_block = re.search(r'```json\s*(\{.*?\})\s*```', raw_response, re.DOTALL)
     if json_block:
         text_to_parse = json_block.group(1)
@@ -83,36 +87,36 @@ def clean_and_parse_json(raw_response):
     try:
         return ast.literal_eval(text_to_parse)
     except Exception as e:
-        safe_log(f"JSON Parse Failed completely: {e}")
+        safe_log(f"JSON Parse Failed: {e}")
         return None
 
 def analyze_content_smart(text):
     """
-    Мозг анализа контента с ИЕРАРХИЧЕСКОЙ категоризацией (Твой новый промпт).
+    Мозг анализа контента (V3 - Fix Prompts Logic).
     """
     safe_log("AI Analysis started...")
     
     hard_found_url = extract_url_from_text(text)
     is_url_present = hard_found_url != "MISSING"
     
+    # --- ОБНОВЛЕННЫЙ ПРОМПТ (Фикс категории Prompts) ---
     system_prompt = (
         "### ROLE: Galaxy Intelligence Core (Strict Classifier)\n\n"
         "### CATEGORY HIERARCHY & LOGIC (Check in this order):\n\n"
-        "1. 'osint' (CRITICAL): Any mention of: hacking, exploits, vulnerabilities, pentesting, bluetooth/wifi attacks, malware, reconnaissance, leaks, privacy, VPN, encryption bypass.\n"
-        "   *Rule: If security-related, ignore all other categories.*\n\n"
-        "2. 'sys' (SYSTEM LEVEL): Any mention of: Windows/Linux/macOS optimization, registry, drivers, ISO images, cleaners, BIOS/UEFI, hardware monitoring, terminal commands for OS tuning.\n\n"
-        "3. 'apk' (MOBILE): Any mention of mobile applications (.apk, .ipa, Google Play, AppStore).\n"
-        "   *Action: You MUST set \"platform\" to \"Android\", \"iOS\", or \"Both\".*\n\n"
-        "4. 'prompts' (AI INPUTS): Large blocks of text meant to be fed into LLMs/AI.\n"
-        "   *Action: Copy the text into \"prompt_body\".*\n\n"
-        "5. 'ai' (AI NEWS/TOOLS): News about OpenAI, Midjourney, new models, neural network architectures, AI services. (Not prompts).\n\n"
-        "6. 'study' (EDUCATION): Academic materials, textbooks, lectures, scientific papers, school/university subjects, presentations.\n\n"
-        "7. 'shop' (COMMERCE): Products for sale, gadgets, shopping lists, price comparisons, \"where to buy\".\n\n"
-        "8. 'fun' (LEISURE): Games, movies, music, travel, restaurants, jokes, hobby content.\n\n"
-        "9. 'dev' (DEVELOPER TOOLS): Production-ready libraries, GitHub repos (non-hacking), APIs, frameworks, Docker, databases, deployment tools.\n\n"
-        "10. 'prog' (LANGUAGE THEORY): Syntax (how to write a loop), IDE setup, learning Python/JS/C++, code snippets for beginners, algorithms theory.\n\n"
-        "11. 'ideas' (FALLBACK): If NONE of the above apply. Any abstract thought, uncategorized note, or general info.\n"
-        "    *Constraint: This is the mandatory category for anything that doesn't fit 1-10.*\n\n"
+        "1. 'osint' (CRITICAL): Security, hacking, exploits, pentesting, privacy, leaks.\n"
+        "   *Rule: If security-related, ignore other categories.*\n\n"
+        "2. 'sys' (SYSTEM): Windows/Linux optimization, drivers, ISOs, cleaners, terminal commands.\n\n"
+        "3. 'apk' (MOBILE): Apps for Android/iOS. *Set \"platform\" to Android/iOS/Both.*\n\n"
+        "4. 'prompts' (AI INSTRUCTIONS): Text intended to be typed into an AI/LLM.\n"
+        "   *Rule: Includes 'jailbreaks', 'personas', 'system prompts', or lists of short commands.*\n"
+        "   *Action: Copy ALL prompt text/bullets into \"prompt_body\".*\n\n"
+        "5. 'ai' (AI NEWS): General news about AI models, tools, services. (Use this ONLY if there is NO specific prompt text to copy).\n\n"
+        "6. 'study' (EDUCATION): Textbooks, lectures, learning paths, science.\n\n"
+        "7. 'shop' (COMMERCE): Goods, prices, shopping.\n\n"
+        "8. 'fun' (LEISURE): Games, media, entertainment.\n\n"
+        "9. 'dev' (CODE): Libraries, Repos, APIs (Non-hacking).\n\n"
+        "10. 'prog' (SYNTAX): Code snippets, how-to-code tutorials.\n\n"
+        "11. 'ideas' (FALLBACK): General notes, uncategorized info.\n\n"
         "### OUTPUT JSON STRUCTURE:\n"
         "{\n"
         "  \"section\": \"key_from_above\",\n"
@@ -120,12 +124,11 @@ def analyze_content_smart(text):
         "  \"desc\": \"Summary in Russian\",\n"
         "  \"url\": \"Link or 'none'\",\n"
         "  \"platform\": \"Android/iOS/Both or 'none'\",\n"
-        "  \"prompt_body\": \"Full prompt text or 'none'\"\n"
+        "  \"prompt_body\": \"Full prompt text (combine if multiple) or 'none'\"\n"
         "}\n\n"
         "### STRICT RULES:\n"
-        "- NO EMPTY FIELDS: Use \"none\" if information is missing.\n"
-        "- VALID JSON ONLY: Double quotes for all keys and string values. Escape internal quotes with \\\".\n"
-        "- ONE CATEGORY ONLY: Choose based on the hierarchy above."
+        "- NO EMPTY FIELDS: Use \"none\" if missing.\n"
+        "- VALID JSON ONLY: Double quotes for all keys/strings.\n"
     )
 
     user_prompt = (
@@ -146,15 +149,14 @@ def analyze_content_smart(text):
 
         # Post-Processing
         ai_url = data.get('url', '')
-        # Исправляем 'none' на '#' для HTML
+        # Если ИИ не нашел ссылку, но мы нашли её через Regex -> берем нашу
         if str(ai_url).lower() in ["none", "missing", ""]:
              data['url'] = hard_found_url if is_url_present else "#"
              
-        # Исправляем 'none' для других полей
         if data.get('platform') == 'none': data['platform'] = ''
         if data.get('prompt_body') == 'none': data['prompt_body'] = ''
         
-        # Коррекция: Prompt на GitHub -> AI/Dev (если это не osint)
+        # Коррекция: Если категория Prompts, но ссылка на GitHub -> меняем на AI или Dev
         section = data.get('section', 'ai').lower()
         if section == 'prompts' and "github.com" in str(data.get('url', '')):
             data['section'] = 'ai' 
@@ -166,7 +168,7 @@ def analyze_content_smart(text):
         return None
 
 def generate_card_html(data):
-    """Генерирует HTML-код карточки"""
+    """Генерирует HTML"""
     s = str(data.get('section', 'ai')).lower()
     
     name = html.escape(str(data.get('name', 'Resource')))
@@ -260,10 +262,7 @@ def generate_card_html(data):
     """
 
 def sync_push_to_github(data, force=False):
-    """
-    Синхронный пуш на GitHub.
-    force=True -> игнорировать проверку дубликатов.
-    """
+    """Синхронный пуш на GitHub (force=True игнорирует дубли)"""
     try:
         repo = gh.get_repo(REPO_NAME)
         branch = "main" 
@@ -271,7 +270,7 @@ def sync_push_to_github(data, force=False):
         contents = repo.get_contents(FILE_PATH, ref=branch)
         html_content = contents.decoded_content.decode("utf-8")
 
-        # 1. Проверка на дубликаты (если не включен force)
+        # 1. Проверка на дубликаты
         target_url = data.get('url', '')
         clean_target = target_url.rstrip('/')
         
@@ -307,39 +306,33 @@ def sync_push_to_github(data, force=False):
 
 # --- TELEGRAM HANDLERS ---
 
-# 1. Обработка кнопок "Да/Нет" при дубликате
 @dp.callback_query(F.data.in_({"dup_yes", "dup_no"}), ToolForm.confirm_duplicate)
 async def process_duplicate_decision(callback: types.CallbackQuery, state: FSMContext):
     state_data = await state.get_data()
     tool_data = state_data.get('tool_data')
     
     if not tool_data:
-        await callback.message.edit_text("❌ Данные устарели. Начни заново.")
+        await callback.message.edit_text("❌ Данные устарели.")
         await state.clear()
         return
 
     if callback.data == "dup_no":
-        await callback.message.edit_text("🙅‍♂️ Отмена. Пост не добавлен.")
+        await callback.message.edit_text("🙅‍♂️ Отмена. Пост пропущен.")
         await state.clear()
     else:
-        # Нажали "Да" -> Форсируем добавление
         await callback.message.edit_text("🚀 Принудительное добавление...")
-        
         result = await asyncio.to_thread(sync_push_to_github, tool_data, force=True)
-        
         if result == "OK":
-            await callback.message.edit_text(f"✅ **{tool_data['name']}** успешно добавлен (Force Push)!")
+            await callback.message.edit_text(f"✅ **{tool_data['name']}** добавлен (Force)!")
         else:
-            await callback.message.edit_text(f"❌ Ошибка записи (код: {result}).")
-        
+            await callback.message.edit_text(f"❌ Ошибка (код: {result}).")
         await state.clear()
 
-# 2. Обработка ручного ввода ссылки
 @dp.message(ToolForm.wait_link)
 async def manual_link_handler(message: types.Message, state: FSMContext):
     state_data = await state.get_data()
     if 'tool_data' not in state_data:
-        await message.answer("❌ Данные потеряны. Начни заново.")
+        await message.answer("❌ Данные потеряны.")
         await state.clear()
         return
 
@@ -347,27 +340,24 @@ async def manual_link_handler(message: types.Message, state: FSMContext):
     tool_data = state_data['tool_data']
     tool_data['url'] = "#" if user_link == "#" else user_link
 
-    # После получения ссылки пробуем запушить
-    status = await message.answer("🔄 Обновляю базу данных Galaxy...")
+    status = await message.answer("🔄 Обновляю базу...")
     result = await asyncio.to_thread(sync_push_to_github, tool_data)
     
     if result == "OK":
-        await status.edit_text(f"✅ **{tool_data['name']}** успешно добавлен!")
+        await status.edit_text(f"✅ **{tool_data['name']}** добавлен!")
         await state.clear()
     elif result == "DUPLICATE":
-        # Если дубликат, показываем кнопки
         keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
             [types.InlineKeyboardButton(text="✅ Все равно добавить", callback_data="dup_yes")],
             [types.InlineKeyboardButton(text="❌ Отмена", callback_data="dup_no")]
         ])
         await state.update_data(tool_data=tool_data)
         await state.set_state(ToolForm.confirm_duplicate)
-        await status.edit_text(f"⚠️ **{tool_data['name']}** уже существует!\nДобавить дубликат?", reply_markup=keyboard)
+        await status.edit_text(f"⚠️ **{tool_data['name']}** уже существует!\nДублировать?", reply_markup=keyboard)
     else:
-        await status.edit_text(f"❌ Ошибка системы (код: {result}).")
+        await status.edit_text(f"❌ Ошибка.")
         await state.clear()
 
-# 3. Основной обработчик сообщений
 @dp.message(StateFilter(None), F.text | F.caption)
 async def main_content_handler(message: types.Message, state: FSMContext):
     content = message.text or message.caption or ""
@@ -376,7 +366,7 @@ async def main_content_handler(message: types.Message, state: FSMContext):
         return
 
     safe_log(f"--- INCOMING DATA ---")
-    status = await message.answer("🧠 Galaxy Intelligence: Анализирую входящие данные...")
+    status = await message.answer("🧠 Galaxy AI: Анализ...")
     
     data = await asyncio.to_thread(analyze_content_smart, content)
 
@@ -388,10 +378,10 @@ async def main_content_handler(message: types.Message, state: FSMContext):
     url = str(data.get('url', ''))
     name = data.get('name', 'Unknown')
     
-    is_no_link_category = section in ['prompts', 'ideas', 'shop', 'fun']
+    is_no_link = section in ['prompts', 'ideas', 'shop', 'fun']
     is_bad_url = (url in ["MISSING", "", "#", "None"] or "ygalaxyy" in url)
 
-    if not is_no_link_category and is_bad_url:
+    if not is_no_link and is_bad_url:
         await state.update_data(tool_data=data)
         await state.set_state(ToolForm.wait_link)
         await status.edit_text(
@@ -399,14 +389,13 @@ async def main_content_handler(message: types.Message, state: FSMContext):
             "⚠️ Не обнаружен прямой линк. Отправь ссылку (или #)."
         )
     else:
-        await status.edit_text(f"🚀 Проверка на дубликаты и деплой **{name}**...")
+        await status.edit_text(f"🚀 Проверка дубликатов и деплой **{name}**...")
         
         result = await asyncio.to_thread(sync_push_to_github, data)
         
         if result == "OK":
-            await status.edit_text(f"✅ Успешная интеграция: **{name}**")
+            await status.edit_text(f"✅ Успешно: **{name}**")
         elif result == "DUPLICATE":
-            # ЛОГИКА ДУБЛИКАТОВ
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
                 [types.InlineKeyboardButton(text="✅ Все равно добавить", callback_data="dup_yes")],
                 [types.InlineKeyboardButton(text="❌ Отмена", callback_data="dup_no")]
@@ -414,15 +403,15 @@ async def main_content_handler(message: types.Message, state: FSMContext):
             await state.update_data(tool_data=data)
             await state.set_state(ToolForm.confirm_duplicate)
             await status.edit_text(
-                f"⚠️ Внимание: Ссылка для **{name}** уже найдена в базе.\nСоздать дубликат записи?", 
+                f"⚠️ Ссылка для **{name}** уже есть в базе.\nСоздать дубликат?", 
                 reply_markup=keyboard
             )
         elif result == "MARKER_ERROR":
-            await status.edit_text(f"❌ Критическая ошибка: Нет метки `<!-- INSERT_{section.upper()}_HERE -->`")
+            await status.edit_text(f"❌ Ошибка: Нет метки `<!-- INSERT_{section.upper()}_HERE -->`")
         else:
-            await status.edit_text("❌ Сбой подключения к GitHub.")
+            await status.edit_text("❌ Сбой GitHub.")
 
-# --- WEB SERVER ДЛЯ RENDER ---
+# --- WEB SERVER ---
 async def health_check(request):
     return web.Response(text="Galaxy Bot is Alive!")
 
