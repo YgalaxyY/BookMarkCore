@@ -30,6 +30,7 @@ def safe_log(text):
 TG_TOKEN = os.getenv("TG_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
+# Для сложной логики Qwen сейчас лучше, но Llama тоже справится с новым промптом
 LLAMA_MODEL = "meta-llama/Llama-3.3-70B-Instruct"
 REPO_NAME = "YgalaxyY/BookMarkCore"
 FILE_PATH = "index.html"
@@ -42,6 +43,7 @@ if not all([TG_TOKEN, GITHUB_TOKEN, HF_TOKEN]):
 class ToolForm(StatesGroup):
     wait_link = State()
     confirm_duplicate = State()
+    select_category = State() # <--- НОВОЕ: Выбор категории при сомнениях
 
 # --- INITIALIZATION ---
 bot = Bot(token=TG_TOKEN)
@@ -53,22 +55,15 @@ gh = Github(auth=auth)
 # --- HELPER FUNCTIONS ---
 
 def extract_url_from_text(text):
-    """
-    Улучшенный поиск ссылок.
-    Видит ссылки в скобках (link), [link], и прилипшие к знакам препинания.
-    """
-    # Regex ищет http/https, исключая скобки, кавычки и пробелы на концах
     urls = re.findall(r'(https?://[^\s<>")\]]+|www\.[^\s<>")\]]+)', text)
     clean_urls = []
     for u in urls:
-        # Убираем лишние точки и запятые на конце, если прилипли
         u = u.rstrip(').,;]')
         if "t.me" not in u and "telegram.me" not in u:
             clean_urls.append(u)
     return clean_urls[0] if clean_urls else "MISSING"
 
 def clean_and_parse_json(raw_response):
-    """Парсер JSON с поддержкой Python dict"""
     text_to_parse = raw_response.strip()
     
     json_block = re.search(r'```json\s*(\{.*?\})\s*```', raw_response, re.DOTALL)
@@ -80,55 +75,68 @@ def clean_and_parse_json(raw_response):
         if start != -1 and end != -1:
             text_to_parse = raw_response[start:end+1]
 
+    text_to_parse = re.sub(r',\s*}', '}', text_to_parse)
+    text_to_parse = re.sub(r',\s*]', ']', text_to_parse)
+
     try:
         return json.loads(text_to_parse)
     except json.JSONDecodeError:
         pass 
+    
     try:
         return ast.literal_eval(text_to_parse)
     except Exception as e:
-        safe_log(f"JSON Parse Failed: {e}")
+        safe_log(f"JSON Parse Failed. Raw content: {text_to_parse[:100]}...")
         return None
 
-def analyze_content_smart(text):
-    """
-    Мозг анализа контента (V3 - Fix Prompts Logic).
-    """
-    safe_log("AI Analysis started...")
-    
+async def analyze_content_with_retry(text, retries=3):
+    for attempt in range(retries):
+        data = await asyncio.to_thread(_analyze_logic, text)
+        if data:
+            return data
+        safe_log(f"⚠️ AI Fail (Attempt {attempt+1}/{retries}). Retrying...")
+        await asyncio.sleep(1)
+    return None
+
+def _analyze_logic(text):
     hard_found_url = extract_url_from_text(text)
     is_url_present = hard_found_url != "MISSING"
     
-    # --- ОБНОВЛЕННЫЙ ПРОМПТ (Фикс категории Prompts) ---
+    # --- ПРОМПТ С LOGIC CHECK (CONFIDENCE) ---
     system_prompt = (
         "### ROLE: Galaxy Intelligence Core (Strict Classifier)\n\n"
         "### CATEGORY HIERARCHY & LOGIC (Check in this order):\n\n"
-        "1. 'osint' (CRITICAL): Security, hacking, exploits, pentesting, privacy, leaks.\n"
+        "1. 'osint' (CRITICAL): Security, hacking, pentesting, privacy, leaks, exploits.\n"
         "   *Rule: If security-related, ignore other categories.*\n\n"
         "2. 'sys' (SYSTEM): Windows/Linux optimization, drivers, ISOs, cleaners, terminal commands.\n\n"
         "3. 'apk' (MOBILE): Apps for Android/iOS. *Set \"platform\" to Android/iOS/Both.*\n\n"
-        "4. 'prompts' (AI INSTRUCTIONS): Text intended to be typed into an AI/LLM.\n"
-        "   *Rule: Includes 'jailbreaks', 'personas', 'system prompts', or lists of short commands.*\n"
-        "   *Action: Copy ALL prompt text/bullets into \"prompt_body\".*\n\n"
-        "5. 'ai' (AI NEWS): General news about AI models, tools, services. (Use this ONLY if there is NO specific prompt text to copy).\n\n"
-        "6. 'study' (EDUCATION): Textbooks, lectures, learning paths, science.\n\n"
+        "4. 'study' (EDUCATION & RESEARCH): Academic materials, research tools, presentations/slides tools.\n"
+        "   *Rule: Tools for creating slides/presentations belong HERE, NOT in AI.*\n\n"
+        "5. 'dev' (CODE): Libraries, Repos, APIs, Web-dev tools, VS Code extensions.\n"
+        "   *Rule: AI coding assistants (like Copilot) go HERE.*\n\n"
+        "6. 'prompts' (AI INSTRUCTIONS): The ACTUAL TEXT intended to be typed into an AI/LLM.\n"
+        "   *CRITICAL DISTINCTION: A TOOL that generates prompts is 'ai' or 'dev'. The PROMPT TEXT itself is 'prompts'.*\n"
+        "   *Action: Copy prompt text into \"prompt_body\".*\n\n"
         "7. 'shop' (COMMERCE): Goods, prices, shopping.\n\n"
         "8. 'fun' (LEISURE): Games, media, entertainment.\n\n"
-        "9. 'dev' (CODE): Libraries, Repos, APIs (Non-hacking).\n\n"
-        "10. 'prog' (SYNTAX): Code snippets, how-to-code tutorials.\n\n"
+        "9. 'ai' (GENERAL AI): News about models, AI industry news, general chatbots. \n"
+        "   *Rule: Use this ONLY if it doesn't fit Study, Dev, OSINT, or Prompts.*\n\n"
+        "10. 'prog' (SYNTAX): Code snippets, tutorials.\n\n"
         "11. 'ideas' (FALLBACK): General notes, uncategorized info.\n\n"
         "### OUTPUT JSON STRUCTURE:\n"
         "{\n"
-        "  \"section\": \"key_from_above\",\n"
+        "  \"section\": \"primary_category\",\n"
+        "  \"alternative\": \"secondary_category_if_unsure_or_none\",\n"
+        "  \"confidence\": 85,  // Integer 0-100. Lower it if the content fits multiple categories (e.g. tool generating prompts).\n"
         "  \"name\": \"Short Title En\",\n"
         "  \"desc\": \"Summary in Russian\",\n"
         "  \"url\": \"Link or 'none'\",\n"
         "  \"platform\": \"Android/iOS/Both or 'none'\",\n"
-        "  \"prompt_body\": \"Full prompt text (combine if multiple) or 'none'\"\n"
+        "  \"prompt_body\": \"Full prompt text or 'none'\"\n"
         "}\n\n"
         "### STRICT RULES:\n"
         "- NO EMPTY FIELDS: Use \"none\" if missing.\n"
-        "- VALID JSON ONLY: Double quotes for all keys/strings.\n"
+        "- VALID JSON ONLY: Double quotes.\n"
     )
 
     user_prompt = (
@@ -142,24 +150,22 @@ def analyze_content_smart(text):
             max_tokens=2500,
             temperature=0.1
         )
-        data = clean_and_parse_json(response.choices[0].message.content.strip())
+        content = response.choices[0].message.content.strip()
+        data = clean_and_parse_json(content)
         
-        if not data:
-            return None
+        if not data: return None
 
         # Post-Processing
         ai_url = data.get('url', '')
-        # Если ИИ не нашел ссылку, но мы нашли её через Regex -> берем нашу
         if str(ai_url).lower() in ["none", "missing", ""]:
              data['url'] = hard_found_url if is_url_present else "#"
              
         if data.get('platform') == 'none': data['platform'] = ''
         if data.get('prompt_body') == 'none': data['prompt_body'] = ''
+        if data.get('alternative') == 'none': data['alternative'] = None
         
-        # Коррекция: Если категория Prompts, но ссылка на GitHub -> меняем на AI или Dev
-        section = data.get('section', 'ai').lower()
-        if section == 'prompts' and "github.com" in str(data.get('url', '')):
-            data['section'] = 'ai' 
+        # Гарантируем наличие confidence
+        if 'confidence' not in data: data['confidence'] = 100
             
         return data
 
@@ -270,7 +276,6 @@ def sync_push_to_github(data, force=False):
         contents = repo.get_contents(FILE_PATH, ref=branch)
         html_content = contents.decoded_content.decode("utf-8")
 
-        # 1. Проверка на дубликаты
         target_url = data.get('url', '')
         clean_target = target_url.rstrip('/')
         
@@ -278,7 +283,6 @@ def sync_push_to_github(data, force=False):
             safe_log(f"Duplicate URL found: {target_url}")
             return "DUPLICATE"
 
-        # 2. Формирование маркера
         sec_key = str(data.get('section', 'ai')).upper()
         target_marker = f"<!-- INSERT_{sec_key}_HERE -->"
         
@@ -286,7 +290,6 @@ def sync_push_to_github(data, force=False):
             safe_log(f"Marker {target_marker} NOT found in HTML!")
             return "MARKER_ERROR"
 
-        # 3. Вставка
         new_card = generate_card_html(data)
         new_html = html_content.replace(target_marker, f"{new_card}\n{target_marker}")
 
@@ -306,6 +309,42 @@ def sync_push_to_github(data, force=False):
 
 # --- TELEGRAM HANDLERS ---
 
+# 1. Выбор категории (когда ИИ сомневается)
+@dp.callback_query(F.data.startswith("cat_"), ToolForm.select_category)
+async def process_category_selection(callback: types.CallbackQuery, state: FSMContext):
+    selected_cat = callback.data.split("_")[1] # Получаем категорию из кнопки
+    state_data = await state.get_data()
+    tool_data = state_data.get('tool_data')
+    
+    if not tool_data:
+        await callback.message.edit_text("❌ Данные устарели.")
+        await state.clear()
+        return
+
+    # Обновляем категорию в данных
+    tool_data['section'] = selected_cat
+    
+    await callback.message.edit_text(f"👌 Выбрана категория: **{selected_cat.upper()}**. Загружаю...")
+    
+    # Пытаемся запушить с новой категорией
+    result = await asyncio.to_thread(sync_push_to_github, tool_data)
+    
+    if result == "OK":
+        await callback.message.edit_text(f"✅ **{tool_data['name']}** успешно добавлен в `{selected_cat.upper()}`!")
+    elif result == "DUPLICATE":
+        # Если вдруг даже так дубликат (маловероятно, но всё же)
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="✅ Добавить дубликат", callback_data="dup_yes")],
+            [types.InlineKeyboardButton(text="❌ Отмена", callback_data="dup_no")]
+        ])
+        await state.update_data(tool_data=tool_data)
+        await state.set_state(ToolForm.confirm_duplicate)
+        await callback.message.edit_text(f"⚠️ Ссылка уже есть. Дублировать?", reply_markup=keyboard)
+    else:
+        await callback.message.edit_text(f"❌ Ошибка (код: {result}).")
+        await state.clear()
+
+# 2. Обработка дубликатов
 @dp.callback_query(F.data.in_({"dup_yes", "dup_no"}), ToolForm.confirm_duplicate)
 async def process_duplicate_decision(callback: types.CallbackQuery, state: FSMContext):
     state_data = await state.get_data()
@@ -317,10 +356,10 @@ async def process_duplicate_decision(callback: types.CallbackQuery, state: FSMCo
         return
 
     if callback.data == "dup_no":
-        await callback.message.edit_text("🙅‍♂️ Отмена. Пост пропущен.")
+        await callback.message.edit_text("🙅‍♂️ Отмена.")
         await state.clear()
     else:
-        await callback.message.edit_text("🚀 Принудительное добавление...")
+        await callback.message.edit_text("🚀 Force Push...")
         result = await asyncio.to_thread(sync_push_to_github, tool_data, force=True)
         if result == "OK":
             await callback.message.edit_text(f"✅ **{tool_data['name']}** добавлен (Force)!")
@@ -328,6 +367,7 @@ async def process_duplicate_decision(callback: types.CallbackQuery, state: FSMCo
             await callback.message.edit_text(f"❌ Ошибка (код: {result}).")
         await state.clear()
 
+# 3. Ручной ввод ссылки
 @dp.message(ToolForm.wait_link)
 async def manual_link_handler(message: types.Message, state: FSMContext):
     state_data = await state.get_data()
@@ -341,6 +381,8 @@ async def manual_link_handler(message: types.Message, state: FSMContext):
     tool_data['url'] = "#" if user_link == "#" else user_link
 
     status = await message.answer("🔄 Обновляю базу...")
+    
+    # После ввода ссылки снова запускаем полную логику (вдруг дубликат?)
     result = await asyncio.to_thread(sync_push_to_github, tool_data)
     
     if result == "OK":
@@ -353,43 +395,69 @@ async def manual_link_handler(message: types.Message, state: FSMContext):
         ])
         await state.update_data(tool_data=tool_data)
         await state.set_state(ToolForm.confirm_duplicate)
-        await status.edit_text(f"⚠️ **{tool_data['name']}** уже существует!\nДублировать?", reply_markup=keyboard)
+        await status.edit_text(f"⚠️ Дубликат! Добавить?", reply_markup=keyboard)
     else:
         await status.edit_text(f"❌ Ошибка.")
         await state.clear()
 
+# 4. Основной обработчик
 @dp.message(StateFilter(None), F.text | F.caption)
 async def main_content_handler(message: types.Message, state: FSMContext):
     content = message.text or message.caption or ""
     
-    if len(content.strip()) < 5 or content.startswith('/'):
-        return
+    if len(content.strip()) < 5 or content.startswith('/'): return
 
     safe_log(f"--- INCOMING DATA ---")
     status = await message.answer("🧠 Galaxy AI: Анализ...")
     
-    data = await asyncio.to_thread(analyze_content_smart, content)
+    data = await analyze_content_with_retry(content)
 
     if not data:
-        await status.edit_text("❌ Ошибка анализа (Невалидный JSON).")
+        await status.edit_text("❌ Ошибка анализа (AI Fail).")
         return
 
     section = str(data.get('section', 'ai')).lower()
+    confidence = data.get('confidence', 100)
+    alt_section = data.get('alternative')
+    
     url = str(data.get('url', ''))
     name = data.get('name', 'Unknown')
     
-    is_no_link = section in ['prompts', 'ideas', 'shop', 'fun']
-    is_bad_url = (url in ["MISSING", "", "#", "None"] or "ygalaxyy" in url)
+    # --- ЛОГИКА СОМНЕНИЙ ---
+    # Если уверенность низкая (<80) И есть альтернатива, предлагаем выбор
+    if confidence < 80 and alt_section and alt_section != section:
+        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+            [
+                types.InlineKeyboardButton(text=f"📂 {section.upper()}", callback_data=f"cat_{section}"),
+                types.InlineKeyboardButton(text=f"📂 {alt_section.upper()}", callback_data=f"cat_{alt_section}")
+            ],
+            [types.InlineKeyboardButton(text="❌ Отмена", callback_data="dup_no")] # Используем логику отмены
+        ])
+        
+        await state.update_data(tool_data=data)
+        await state.set_state(ToolForm.select_category)
+        
+        await status.edit_text(
+            f"🤔 **Сомнения AI** (Уверенность: {confidence}%)\n"
+            f"Объект: **{name}**\n"
+            f"Куда определить?",
+            reply_markup=keyboard
+        )
+        return
 
-    if not is_no_link and is_bad_url:
+    # Если уверенность норм -> идем дальше
+    is_no_link = section in ['prompts', 'ideas', 'shop', 'fun']
+    is_bad = (url in ["MISSING", "", "#", "None"] or "ygalaxyy" in url)
+
+    if not is_no_link and is_bad:
         await state.update_data(tool_data=data)
         await state.set_state(ToolForm.wait_link)
         await status.edit_text(
             f"🧐 Объект: **{name}** -> Секция: `{section.upper()}`\n"
-            "⚠️ Не обнаружен прямой линк. Отправь ссылку (или #)."
+            "⚠️ Пришли ссылку (или #)."
         )
     else:
-        await status.edit_text(f"🚀 Проверка дубликатов и деплой **{name}**...")
+        await status.edit_text(f"🚀 Деплой **{name}** в `{section.upper()}`...")
         
         result = await asyncio.to_thread(sync_push_to_github, data)
         
@@ -397,15 +465,12 @@ async def main_content_handler(message: types.Message, state: FSMContext):
             await status.edit_text(f"✅ Успешно: **{name}**")
         elif result == "DUPLICATE":
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="✅ Все равно добавить", callback_data="dup_yes")],
-                [types.InlineKeyboardButton(text="❌ Отмена", callback_data="dup_no")]
+                [types.InlineKeyboardButton(text="✅ Да, добавить", callback_data="dup_yes")],
+                [types.InlineKeyboardButton(text="❌ Нет, отмена", callback_data="dup_no")]
             ])
             await state.update_data(tool_data=data)
             await state.set_state(ToolForm.confirm_duplicate)
-            await status.edit_text(
-                f"⚠️ Ссылка для **{name}** уже есть в базе.\nСоздать дубликат?", 
-                reply_markup=keyboard
-            )
+            await status.edit_text(f"⚠️ Ссылка уже есть в базе. Дублировать?", reply_markup=keyboard)
         elif result == "MARKER_ERROR":
             await status.edit_text(f"❌ Ошибка: Нет метки `<!-- INSERT_{section.upper()}_HERE -->`")
         else:
