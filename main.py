@@ -34,11 +34,11 @@ REPO_NAME = "YgalaxyY/BookMarkCore"
 FILE_PATH = "index.html"
 
 # СПИСОК МОДЕЛЕЙ (Каскадная система)
-# Если первая не отвечает, бот переходит ко второй и так далее.
+# Бот будет пробовать их по очереди, пока одна не ответит
 AI_MODELS_QUEUE = [
-    "Qwen/Qwen2.5-72B-Instruct",       # 1. Топ по логике и русскому языку
-    "meta-llama/Llama-3.3-70B-Instruct", # 2. Мощная, но часто перегружена
-    "meta-llama/Meta-Llama-3.1-8B-Instruct", # 3. Легкая и быстрая (резерв)
+    "Qwen/Qwen2.5-72B-Instruct",             # 1. Лучшая логика
+    "meta-llama/Llama-3.3-70B-Instruct",     # 2. Мощная, но перегруженная
+    "meta-llama/Meta-Llama-3.1-8B-Instruct", # 3. Быстрая (резерв)
     "mistralai/Mistral-Nemo-Instruct-2407"   # 4. Запасной вариант
 ]
 
@@ -96,33 +96,43 @@ def clean_and_parse_json(raw_response):
         safe_log(f"JSON Parse Failed: {e}")
         return None
 
-# --- PLAN B: HEURISTIC ANALYSIS ---
+# --- ПЛАН Б: ЭВРИСТИЧЕСКИЙ АНАЛИЗ (Если ИИ сдох) ---
 def fallback_heuristic_analysis(text):
     """
-    Если все нейросети упали, анализируем текст вручную по ключевым словам.
+    Если все нейросети упали или вернули ошибку, этот код
+    определит категорию по ключевым словам.
     """
     safe_log("🔧 ВСЕ МОДЕЛИ ЗАНЯТЫ. Запуск эвристического анализа (Plan B)...")
     
     # 1. Проверка на PROMPTS (Теги XML, ключевые фразы)
+    # Это спасет твой пост с <Role> и <Context>
     prompt_markers = [
-        '<Role>', '<System>', '<Context>', '<Instructions>', 
+        '<Role>', '<System>', '<Context>', '<Instructions>', '<Output_Format>',
         'Act as a', 'You are a', 'Представь, что ты', 
-        'Напиши промпт', 'System prompt:', 'Промт:'
+        'Напиши промпт', 'System prompt:', 'Промт:', 'Prompt:'
     ]
+    
     if any(marker in text for marker in prompt_markers):
         lines = text.split('\n')
-        title = lines[0][:60].strip() + "..." if len(lines) > 0 else "AI Prompt"
+        # Берем первую осмысленную строку как заголовок
+        title = "AI Prompt"
+        for line in lines:
+            if len(line.strip()) > 5:
+                title = line.strip()[:60] + "..."
+                break
+                
         return {
             "section": "prompts",
             "name": title,
             "desc": "System Prompt (Auto-detected via fallback)",
             "url": "#",
             "platform": "",
-            "prompt_body": text, # Сохраняем весь текст
-            "confidence": 100
+            "prompt_body": text, # Сохраняем ВЕСЬ текст
+            "confidence": 100,
+            "alternative": None
         }
 
-    # 2. Проверка на GitHub
+    # 2. Проверка на GitHub -> Dev
     url = extract_url_from_text(text)
     if "github.com" in url:
         return {
@@ -132,7 +142,8 @@ def fallback_heuristic_analysis(text):
             "url": url,
             "platform": "",
             "prompt_body": "",
-            "confidence": 90
+            "confidence": 90,
+            "alternative": None
         }
 
     # 3. Дефолт - Ideas
@@ -143,13 +154,15 @@ def fallback_heuristic_analysis(text):
         "url": url if url != "MISSING" else "#",
         "platform": "",
         "prompt_body": "",
-        "confidence": 50
+        "confidence": 50,
+        "alternative": None
     }
 
-# --- AI CORE LOGIC ---
+# --- AI CORE LOGIC (ROTATION) ---
 async def analyze_with_model_rotation(text):
     """
     Пробует модели по очереди. Если одна падает, берет следующую.
+    Если все упали -> вызывает fallback_heuristic_analysis.
     """
     hard_found_url = extract_url_from_text(text)
     is_url_present = hard_found_url != "MISSING"
@@ -197,9 +210,7 @@ async def analyze_with_model_rotation(text):
     for model_name in AI_MODELS_QUEUE:
         safe_log(f"🤖 Trying model: {model_name}...")
         try:
-            # Создаем клиент под конкретную модель
             client = InferenceClient(model=model_name, token=HF_TOKEN)
-            
             response = await asyncio.to_thread(
                 client.chat_completion,
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
@@ -210,7 +221,6 @@ async def analyze_with_model_rotation(text):
             data = clean_and_parse_json(content)
             
             if data:
-                # Успех! Обрабатываем и возвращаем
                 safe_log(f"✅ Success with {model_name}")
                 
                 ai_url = data.get('url', '')
@@ -226,9 +236,9 @@ async def analyze_with_model_rotation(text):
             
         except Exception as e:
             safe_log(f"❌ Error with {model_name}: {e}")
-            continue # Пробуем следующую модель
+            continue 
 
-    # Если ни одна модель не справилась
+    # Если мы здесь — все модели упали. Включаем План Б.
     return fallback_heuristic_analysis(text)
 
 def generate_card_html(data):
@@ -434,11 +444,11 @@ async def main_content_handler(message: types.Message, state: FSMContext):
 
     status = await message.answer("🧠 Galaxy AI: Анализ...")
     
-    # ЗАПУСКАЕМ КАСКАДНЫЙ АНАЛИЗ (Модель 1 -> Модель 2 -> ... -> Эвристика)
+    # ТЕПЕРЬ МЫ ИСПОЛЬЗУЕМ "ROTATION" (КАСКАД МОДЕЛЕЙ + ЭВРИСТИКУ)
     data = await analyze_with_model_rotation(content)
 
     if not data:
-        await status.edit_text("❌ Ошибка анализа (Все модели заняты).")
+        await status.edit_text("❌ Ошибка анализа (Даже эвристика не справилась).")
         return
 
     section = str(data.get('section', 'ai')).lower()
