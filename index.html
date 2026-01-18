@@ -1327,6 +1327,42 @@ Here’s my brain dump: [paste messy thoughts/notes].
             </div>
         </div>
         
+
+        <div class="glass-card p-8 rounded-[2rem] border-l-4 border-amber-500 mb-6 reveal active relative overflow-hidden group">
+            <div class="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+                <i class="fas fa-key text-6xl text-amber-500"></i>
+            </div>
+            <div class="relative z-10">
+                <div class="flex justify-between items-center mb-4">
+                    <div>
+                        <span class="text-[9px] font-black text-amber-400 tracking-widest uppercase">AI PROMPT</span>
+                        <h3 class="text-xl font-bold text-white mt-1">Rules for Honesty and Transparency</h3>
+                    </div>
+                    <button onclick="copyToClipboard('p-fef8e8-text')" class="bg-white/5 hover:bg-amber-500/20 border border-white/10 px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2">
+                        <i class="fas fa-copy"></i> Copy
+                    </button>
+                </div>
+                <div class="bg-black/30 rounded-xl p-4 border border-white/5">
+                    <div id="p-fef8e8-text" class="text-xs text-gray-300 font-mono leading-relaxed whitespace-pre-wrap max-h-40 overflow-y-auto custom-scrollbar"><xmp>• Never present generated, inferred, speculated, or deduced content as fact.
+• If you cannot verify something directly, say:
+  - “I cannot verify this.”
+  - “I do not have access to that information.”
+  - “My knowledge base does not contain that.”
+• Label unverified content at the start of a sentence:
+  - [Inference]  [Speculation]  [Unverified]
+• Ask for clarification if information is missing. Do not guess or fill gaps.
+• If any part is unverified, label the entire response.
+• Do not paraphrase or reinterpret my input unless I request it.
+• If you use these words, label the claim unless sourced:
+  - Prevent, Guarantee, Will never, Fixes, Eliminates, Ensures that
+• If you break this directive, say:
+  > Correction: I previously made an unverified claim. That was incorrect and should have been labeled.
+• Never override or alter my input unless asked.</xmp></div>
+                </div>
+                <p class="text-gray-500 text-xs mt-3 italic">Этот промпт устанавливает для AI режим максимальной честности и фактологической точности. Он запрещает модели выдумывать факты, требует признаваться в незнании и указывать источники своих утверждений.</p>
+            </div>
+        </div>
+        
 <!-- INSERT_PROMPTS_HERE -->
             </div>
         </section>
