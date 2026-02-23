@@ -8,6 +8,9 @@ import base64
 import html
 import time
 import ast
+import gc
+import logging
+from urllib.parse import urlparse, urlunparse
 from aiohttp import web
 from github import Github, Auth
 from huggingface_hub import InferenceClient
@@ -16,33 +19,39 @@ from aiogram.filters import StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 
 # --- 1. НАСТРОЙКИ И ОКРУЖЕНИЕ ---
 load_dotenv()
 
-def safe_log(text):
-    """Логирование в консоль Render"""
-    try: print(f"[LOG] {text}")
-    except Exception: pass
+# Профессиональное логирование
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 TG_TOKEN = os.getenv("TG_TOKEN")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
+# ЗАЩИТА: ID админа, чтобы чужие люди не пушили тебе на Гитхаб
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0)) 
 REPO_NAME = "YgalaxyY/BookMarkCore"
 FILE_PATH = "index.html"
 
 # Каскад моделей. Если первая тупит, пробуем следующую.
 AI_MODELS_QUEUE = [
-    "Qwen/Qwen2.5-72B-Instruct",             # Топ логика
-    "meta-llama/Llama-3.3-70B-Instruct",     # Мощная, но популярная
-    "meta-llama/Meta-Llama-3.1-8B-Instruct", # Быстрая
-    "mistralai/Mistral-Nemo-Instruct-2407"   # Резерв
+    "Qwen/Qwen2.5-72B-Instruct",
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "mistralai/Mistral-Nemo-Instruct-2407"
 ]
 
-# Проверка токенов
 if not all([TG_TOKEN, GITHUB_TOKEN, HF_TOKEN]):
-    safe_log("⚠️ Warning: Tokens missing via .env (Check Render Environment)")
+    logger.warning("Tokens missing via .env (Check Render Environment)")
+if not ADMIN_ID:
+    logger.warning("ADMIN_ID is not set! The bot might respond to strangers.")
 
 # Состояния FSM
 class ToolForm(StatesGroup):
@@ -56,75 +65,64 @@ dp = Dispatcher(storage=MemoryStorage())
 auth = Auth.Token(GITHUB_TOKEN)
 gh = Github(auth=auth)
 
+# --- МИДЛВАРЬ: ПРОВЕРКА НА АДМИНА ---
+@dp.message.outer_middleware()
+async def admin_middleware(handler, event: types.Message, data: dict):
+    if ADMIN_ID and event.from_user.id != ADMIN_ID:
+        logger.warning(f"Unauthorized access attempt from User: {event.from_user.id}")
+        return # Игнорируем чужих
+    return await handler(event, data)
+
 
 # --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 def extract_url_from_text(text):
-    """
-    Ищет ссылки.
-    1. Игнорирует общие ссылки на каналы (t.me/channel), так как это часто реклама.
-    2. НО! Принимает ссылки на КОНКРЕТНЫЕ посты (t.me/channel/123), так как это может быть ресурс.
-    """
     urls = re.findall(r'(https?://[^\s<>")\]]+|www\.[^\s<>")\]]+)', text)
     clean_urls = []
     
     for u in urls:
-        u = u.rstrip(').,;]') # Убираем мусор в конце
-        
-        # Логика для Telegram
+        u = u.rstrip(').,;]')
         if "t.me" in u or "telegram.me" in u:
-            # Если это ссылка на конкретный пост (есть цифры в конце) -> Берем
             if re.search(r'\/[\w_]+\/\d+', u):
                 clean_urls.append(u)
-            # Иначе (просто ссылка на канал) -> Игнорируем
             continue
-            
         clean_urls.append(u)
         
     return clean_urls[0] if clean_urls else "MISSING"
 
 def clean_and_parse_json(raw_response):
-    """
-    Очищает ответ ИИ от Markdown, лишних запятых и парсит JSON.
-    """
     text = raw_response.strip()
-    
-    # 1. Если ответ обернут в ```json ... ```, достаем внутренности
     json_block = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
     if json_block:
         text = json_block.group(1)
     else:
-        # Иначе ищем от первой { до последней }
         start = text.find('{')
         end = text.rfind('}')
         if start != -1 and end != -1:
             text = text[start:end+1]
 
-    # 2. Чистим типичные ошибки LLM (висячие запятые)
     text = re.sub(r',\s*}', '}', text)
     text = re.sub(r',\s*]', ']', text)
 
-    # 3. Парсим
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass 
-    
-    # 4. Fallback: пробуем через Python AST (если кавычки одинарные)
     try:
         return ast.literal_eval(text)
     except Exception:
         return None
 
+def normalize_url(url):
+    if url in ["MISSING", "#", ""]: 
+        return url
+    parsed = urlparse(url)
+    clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
+    return clean.rstrip('/')
 
 # --- 3. МОЗГИ БОТА (ЭВРИСТИКА + ИИ) ---
 
 def heuristic_analysis(text):
-    """
-    Быстрый анализ БЕЗ нейросети.
-    Используется для 100% промптов или как запасной вариант.
-    """
-    # Список маркеров промпта (Русский и Английский)
     prompt_markers = [
         '<Role>', '<System>', '<Context>', '<Instructions>', '<Output_Format>',
         '<Роль>', '<Система>', '<Контекст>', '<Инструкции>', 
@@ -133,21 +131,16 @@ def heuristic_analysis(text):
         'Напиши код', 'Write code'
     ]
     
-    # Если найден маркер промпта — это ПРОМПТ.
     if any(marker in text for marker in prompt_markers):
-        safe_log("⚡ Heuristic detected a PROMPT. Skipping AI.")
-        
-        # Пытаемся найти начало промпта, чтобы отрезать вступление
+        logger.info("⚡ Heuristic detected a PROMPT. Skipping AI.")
         start_idx = len(text)
         for marker in prompt_markers:
             idx = text.find(marker)
             if idx != -1 and idx < start_idx:
                 start_idx = idx
         
-        # Если нашли начало, берем текст оттуда. Если нет - весь текст.
         prompt_body = text[start_idx:].strip() if start_idx < len(text) else text
         
-        # Генерируем заголовок из первой строки
         lines = text.split('\n')
         title = "AI Prompt"
         for line in lines:
@@ -163,65 +156,55 @@ def heuristic_analysis(text):
             "platform": "",
             "prompt_body": prompt_body,
             "confidence": 100,
-            "alternative": None
+            "alternative": None,
+            "thought_process": "Detected prompt markers in text.",
+            "reply_text": "Отличный промпт! Сохраняю в коллекцию 📝"
         }
-
-    # Если не промпт — возвращаем None, пусть работает ИИ
     return None
 
 def fallback_if_ai_fails(text):
-    """
-    Если ИИ упал, пытаемся хоть как-то определить категорию.
-    """
-    safe_log("🔧 AI Failed completely. Using Fallback logic.")
-    
+    logger.warning("🔧 AI Failed completely. Using Fallback logic.")
     url = extract_url_from_text(text)
     lines = text.split('\n')
     title = lines[0][:50] + "..." if lines else "New Resource"
 
-    # Если ссылка на GitHub -> Dev
     if "github.com" in url:
-        return {"section": "dev", "name": title, "desc": "GitHub Repo", "url": url, "prompt_body": "", "confidence": 100}
+        return {"section": "dev", "name": title, "desc": "GitHub Repo", "url": url, "prompt_body": "", "confidence": 100, "alternative": None, "reply_text": "Репозиторий на GitHub! Добавляю в раздел разработки 💻"}
     
-    # Иначе -> Ideas
-    return {"section": "ideas", "name": title, "desc": text[:100]+"...", "url": url if url != "MISSING" else "#", "prompt_body": "", "confidence": 50}
+    return {"section": "ideas", "name": title, "desc": text[:100]+"...", "url": url if url != "MISSING" else "#", "prompt_body": "", "confidence": 50, "alternative": None, "reply_text": "Сохраняю как идею 📝"}
 
 async def analyze_content_full_cycle(text):
-    """
-    ГЛАВНЫЙ ЦИКЛ АНАЛИЗА:
-    1. Эвристика (проверка на явный промпт).
-    2. Каскад нейросетей (Qwen -> Llama...).
-    3. Fallback (если все упало).
-    """
-    
-    # Шаг 1: Эвристика
     heuristic_data = heuristic_analysis(text)
     if heuristic_data:
         return heuristic_data
 
-    # Шаг 2: Нейросети
     hard_found_url = extract_url_from_text(text)
     is_url_present = hard_found_url != "MISSING"
 
-    # ФИНАЛЬНЫЙ СИСТЕМНЫЙ ПРОМПТ
     system_prompt = (
-        "### ROLE: Galaxy Intelligence Core (Strict Classifier)\n\n"
+        "### ROLE: Galaxy Intelligence Core (Charismatic AI Assistant)\n\n"
+        "### TASK: Analyze content and respond as a living assistant\n\n"
         "### CATEGORY LOGIC (Check strict order):\n"
-        "1. 'osint' (SECURITY): Hacking, exploits, pentesting, privacy, leaks, deanonymization.\n"
-        "2. 'prompts' (TEXT INPUTS): The actual text meant to be typed into ChatGPT/Midjourney. (Keywords: 'Act as', 'System:', 'Prompt:').\n"
+        "1. 'osint' (SECURITY): Hacking, exploits, pentesting, privacy, leaks.\n"
+        "2. 'prompts' (TEXT INPUTS): The actual text meant to be typed into ChatGPT/Midjourney.\n"
         "   *ACTION: Copy the prompt text to 'prompt_body'.*\n"
         "3. 'sys' (SYSTEM): Windows/Linux tools, cleaners, ISOs, drivers, terminal commands.\n"
         "4. 'apk' (MOBILE): Apps for Android/iOS.\n"
         "5. 'study' (EDUCATION): Tutorials, research papers, creating presentations/slides, finding citations, university tools.\n"
-        "   *Rule: Tools like 'ChatSlide' or 'Gamma' belong here.*\n"
         "6. 'dev' (CODE): Libraries, APIs, Web-builders, VS Code, No-Code tools.\n"
         "7. 'shop' (COMMERCE): Goods, prices.\n"
         "8. 'fun' (LEISURE): Games, movies, entertainment.\n"
         "9. 'ai' (GENERAL AI): News, models, chatbots. (ONLY if not Study/Dev/Prompts).\n"
         "10. 'prog' (SYNTAX): Code snippets.\n"
         "11. 'ideas' (FALLBACK): General notes.\n\n"
+        "### CHAIN OF THOUGHT: First think, then answer!\n"
+        "1. Analyze what the user sent\n"
+        "2. Consider the context and purpose\n"
+        "3. Choose the best category\n"
+        "4. Write a charismatic response with emojis\n\n"
         "### OUTPUT JSON:\n"
         "{\n"
+        "  \"thought_process\": \"Brief analysis...\",\n"
         "  \"section\": \"category\",\n"
         "  \"alternative\": \"alt_category_or_none\",\n"
         "  \"confidence\": 90,\n"
@@ -229,64 +212,67 @@ async def analyze_content_full_cycle(text):
         "  \"desc\": \"Summary in Russian\",\n"
         "  \"url\": \"Link or 'none'\",\n"
         "  \"platform\": \"Android/iOS/none\",\n"
-        "  \"prompt_body\": \"Full prompt text or 'none'\"\n"
+        "  \"prompt_body\": \"Full prompt text or 'none'\",\n"
+        "  \"reply_text\": \"Living response to user\"\n"
         "}\n"
         "### RULES: Double quotes JSON. No empty fields (use 'none')."
     )
 
     user_prompt = f"ANALYZE:\n{text[:8000]}\nURL: {hard_found_url}"
-
+    
     for model_name in AI_MODELS_QUEUE:
-        safe_log(f"🤖 Asking: {model_name}...")
+        logger.info(f"🤖 Asking: {model_name}...")
         try:
             client = InferenceClient(model=model_name, token=HF_TOKEN)
-            # Увеличил таймаут и токены
-            response = await asyncio.to_thread(
-                client.chat_completion,
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                max_tokens=4000,
-                temperature=0.1
+            
+            # --- ANTI-FREEZE: ТАЙМАУТ ---
+            # Если HF зависнет, мы ждем максимум 25 секунд, прерываем и идем к след. модели
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.chat_completion,
+                    messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                    max_tokens=4000,
+                    temperature=0.1
+                ),
+                timeout=25.0
             )
+            
             content = response.choices[0].message.content.strip()
             data = clean_and_parse_json(content)
             
             if data:
-                safe_log(f"✅ Success: {model_name}")
-                # Нормализация данных
+                logger.info(f"✅ Success: {model_name}")
                 ai_url = data.get('url', '')
                 if str(ai_url).lower() in ["none", "missing", "", "#"]:
                      data['url'] = hard_found_url if is_url_present else "#"
                 
-                # Заглушки для пустых полей
                 for key in ['platform', 'prompt_body', 'alternative']:
                     if data.get(key) in ['none', None]: data[key] = None
                 
                 if 'confidence' not in data: data['confidence'] = 100
                 return data
             
+        except asyncio.TimeoutError:
+            logger.error(f"⏳ Timeout Error with {model_name}. API is hanging.")
+            continue
         except Exception as e:
-            safe_log(f"❌ Fail {model_name}: {e}")
-            await asyncio.sleep(1) # Даем паузу перед следующей моделью
+            logger.error(f"❌ Fail {model_name}: {e}")
+            await asyncio.sleep(1)
             continue 
 
-    # Шаг 3: Если всё сломалось
     return fallback_if_ai_fails(text)
 
 
 # --- 4. ГЕНЕРАЦИЯ HTML ---
-
+# (Без изменений, логика идеальна)
 def generate_card_html(data):
     s = str(data.get('section', 'ai')).lower()
-    
-    # Экранирование для безопасности
     name = html.escape(str(data.get('name', 'Resource')))
     url = str(data.get('url', '#'))
     desc = html.escape(str(data.get('desc', 'No description.')))
-    # Prompt Body НЕ экранируем полностью, но чистим от </xmp>
     p_body = str(data.get('prompt_body', '')).replace('</xmp>', '')
     platform = html.escape(str(data.get('platform', 'App')))
 
-    # Настройки стилей
     meta = {
         "ideas":  {"icon": "lightbulb",      "color": "yellow"},
         "fun":    {"icon": "gamepad",        "color": "pink"},
@@ -305,7 +291,6 @@ def generate_card_html(data):
     color = style["color"]
     icon = style["icon"]
 
-    # ШАБЛОН ДЛЯ PROMPTS
     if s == 'prompts':
         p_id = f"p-{uuid.uuid4().hex[:6]}"
         return f"""
@@ -331,7 +316,6 @@ def generate_card_html(data):
         </div>
         """
     
-    # ШАБЛОН ДЛЯ APK
     if s == 'apk':
         return f"""
         <div class="glass-card p-8 rounded-[2rem] hover:bg-white/5 transition-all duration-300 reveal active border-t border-white/5 mb-6">
@@ -353,7 +337,6 @@ def generate_card_html(data):
         </div>
         """
 
-    # СТАНДАРТНЫЙ ШАБЛОН
     return f"""
     <div class="glass-card p-8 rounded-[2rem] hover:bg-white/5 transition-all duration-300 reveal active border-t border-white/5 mb-6">
         <div class="flex items-start gap-4">
@@ -378,7 +361,6 @@ def generate_card_html(data):
 # --- 5. ЗАПИСЬ НА GITHUB ---
 
 def sync_push_to_github(data, force=False):
-    """Синхронный пуш"""
     try:
         repo = gh.get_repo(REPO_NAME)
         branch = "main" 
@@ -386,12 +368,16 @@ def sync_push_to_github(data, force=False):
         html_content = contents.decoded_content.decode("utf-8")
 
         target_url = data.get('url', '')
-        clean_target = target_url.rstrip('/')
+        clean_target = normalize_url(target_url)
         
-        # Проверка дубликатов (если не Force Push)
-        if not force and target_url and target_url not in ["#", "MISSING"] and (clean_target in html_content):
-            safe_log(f"Duplicate found: {target_url}")
-            return "DUPLICATE"
+        if not force and clean_target and clean_target not in ["#", "MISSING", ""]:
+            if clean_target in html_content:
+                logger.info(f"Duplicate found: {clean_target}")
+                return "DUPLICATE"
+            name = html.escape(str(data.get('name', '')))
+            if name and name in html_content:
+                logger.info(f"Duplicate by name found: {name}")
+                return "DUPLICATE"
 
         sec_key = str(data.get('section', 'ai')).upper()
         target_marker = f"<!-- INSERT_{sec_key}_HERE -->"
@@ -406,7 +392,7 @@ def sync_push_to_github(data, force=False):
         repo.update_file(contents.path, commit_msg, new_html, contents.sha, branch)
         return "OK"
     except Exception as e:
-        safe_log(f"GitHub Push Error: {e}")
+        logger.error(f"GitHub Push Error: {e}")
         return "GIT_ERROR"
 
 
@@ -414,7 +400,6 @@ def sync_push_to_github(data, force=False):
 
 @dp.callback_query(F.data.startswith("cat_"), ToolForm.select_category)
 async def process_category_selection(callback: types.CallbackQuery, state: FSMContext):
-    """Обработка выбора категории (при сомнениях)"""
     selected_cat = callback.data.split("_")[1]
     state_data = await state.get_data()
     tool_data = state_data.get('tool_data')
@@ -434,7 +419,6 @@ async def process_category_selection(callback: types.CallbackQuery, state: FSMCo
 
 @dp.callback_query(F.data.in_({"dup_yes", "dup_no"}), ToolForm.confirm_duplicate)
 async def process_duplicate_decision(callback: types.CallbackQuery, state: FSMContext):
-    """Обработка дубликатов (Да/Нет)"""
     state_data = await state.get_data()
     tool_data = state_data.get('tool_data')
     if not tool_data:
@@ -454,7 +438,6 @@ async def process_duplicate_decision(callback: types.CallbackQuery, state: FSMCo
 
 @dp.message(ToolForm.wait_link)
 async def manual_link_handler(message: types.Message, state: FSMContext):
-    """Обработка ручного ввода ссылки"""
     state_data = await state.get_data()
     if 'tool_data' not in state_data:
         await message.answer("❌ Данные потеряны (Бот перезагрузился).")
@@ -462,7 +445,6 @@ async def manual_link_handler(message: types.Message, state: FSMContext):
         return
 
     user_link = message.text.strip()
-    # Берем старые данные, просто добавляем ссылку
     tool_data = state_data['tool_data']
     tool_data['url'] = "#" if user_link == "#" else user_link
 
@@ -486,68 +468,75 @@ async def manual_link_handler(message: types.Message, state: FSMContext):
 
 @dp.message(StateFilter(None), F.text | F.caption)
 async def main_content_handler(message: types.Message, state: FSMContext):
-    """ГЛАВНЫЙ ОБРАБОТЧИК"""
-    content = message.text or message.caption or ""
-    
-    # 1. ЗАЩИТА ОТ ГОЛЫХ ССЫЛОК (Если мы не в состоянии ожидания)
-    # Если сообщение - это просто URL, и бот никого не ждал -> значит контекст потерян
-    if re.match(r'^https?://\S+$', content.strip()):
-        await message.reply("⚠️ Это просто ссылка. Если это дополнение к посту, то я потерял контекст (перезагрузка сервера). Пожалуйста, отправь пост целиком.")
-        return
+    try:
+        content = message.text or message.caption or ""
+        
+        if re.match(r'^https?://\S+$', content.strip()):
+            await message.reply("⚠️ Это просто ссылка. Если это дополнение к посту, то я потерял контекст. Пожалуйста, отправь пост целиком.")
+            return
 
-    if len(content.strip()) < 5: return
+        if len(content.strip()) < 5: return
 
-    status = await message.answer("🧠 Galaxy AI: Анализ...")
-    
-    # ЗАПУСКАЕМ ПОЛНЫЙ ЦИКЛ (Эвристика -> ИИ -> Fallback)
-    data = await analyze_content_full_cycle(content)
+        # --- UX: Отправляем статус "Печатает..." ---
+        await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+        status = await message.answer("🧠 <i>Анализирую информацию...</i>", parse_mode=ParseMode.HTML)
+        
+        data = await analyze_content_full_cycle(content)
 
-    if not data:
-        await status.edit_text("❌ Критическая ошибка анализа.")
-        return
+        if not data:
+            await status.edit_text("❌ Критическая ошибка анализа.")
+            return
 
-    section = str(data.get('section', 'ai')).lower()
-    confidence = data.get('confidence', 100)
-    alt_section = data.get('alternative')
-    name = data.get('name', 'Unknown')
-    url = str(data.get('url', ''))
-    
-    # 2. Если ИИ сомневается
-    if confidence < 80 and alt_section and alt_section != section:
-        keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-            [
-                types.InlineKeyboardButton(text=f"📂 {section.upper()}", callback_data=f"cat_{section}"),
-                types.InlineKeyboardButton(text=f"📂 {alt_section.upper()}", callback_data=f"cat_{alt_section}")
-            ],
-            [types.InlineKeyboardButton(text="❌ Отмена", callback_data="dup_no")]
-        ])
-        await state.update_data(tool_data=data)
-        await state.set_state(ToolForm.select_category)
-        await status.edit_text(f"🤔 **Сомнения** ({confidence}%)\nОбъект: **{name}**", reply_markup=keyboard)
-        return
-
-    # 3. Проверка ссылки (нужна ли она)
-    is_no_link = section in ['prompts', 'ideas', 'shop', 'fun']
-    is_bad = (url in ["MISSING", "", "#", "None"] or "ygalaxyy" in url)
-
-    if not is_no_link and is_bad:
-        await state.update_data(tool_data=data)
-        await state.set_state(ToolForm.wait_link)
-        await status.edit_text(f"🧐 **{name}** [{section.upper()}]\n⚠️ Пришли ссылку.")
-    else:
-        await status.edit_text(f"🚀 Деплой **{name}**...")
-        result = await asyncio.to_thread(sync_push_to_github, data)
-        if result == "OK": await status.edit_text(f"✅ Успешно: **{name}**")
-        elif result == "DUPLICATE":
+        section = str(data.get('section', 'ai')).lower()
+        confidence = data.get('confidence', 100)
+        alt_section = data.get('alternative')
+        name = data.get('name', 'Unknown')
+        url = str(data.get('url', ''))
+        bot_reply = data.get('reply_text', f"🚀 Деплой {name}...")
+        
+        if confidence < 80 and alt_section and alt_section != section:
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
-                [types.InlineKeyboardButton(text="✅ Добавить", callback_data="dup_yes")],
+                [
+                    types.InlineKeyboardButton(text=f"📂 {section.upper()}", callback_data=f"cat_{section}"),
+                    types.InlineKeyboardButton(text=f"📂 {alt_section.upper()}", callback_data=f"cat_{alt_section}")
+                ],
                 [types.InlineKeyboardButton(text="❌ Отмена", callback_data="dup_no")]
             ])
             await state.update_data(tool_data=data)
-            await state.set_state(ToolForm.confirm_duplicate)
-            await status.edit_text(f"⚠️ Дубликат!", reply_markup=keyboard)
-        elif result == "MARKER_ERROR": await status.edit_text(f"❌ Нет метки HTML.")
-        else: await status.edit_text("❌ Сбой GitHub.")
+            await state.set_state(ToolForm.select_category)
+            await status.edit_text(f"🤔 <b>Сомнения</b> ({confidence}%)\nОбъект: <b>{name}</b>", reply_markup=keyboard, parse_mode=ParseMode.HTML)
+            return
+
+        is_no_link = section in ['prompts', 'ideas', 'shop', 'fun']
+        is_bad = (url in ["MISSING", "", "#", "None"] or "ygalaxyy" in url)
+
+        if not is_no_link and is_bad:
+            await state.update_data(tool_data=data)
+            await state.set_state(ToolForm.wait_link)
+            await status.edit_text(f"🧐 <b>{name}</b> [{section.upper()}]\n⚠️ Пришли ссылку.", parse_mode=ParseMode.HTML)
+        else:
+            await status.edit_text(f"💬 {bot_reply}")
+            result = await asyncio.to_thread(sync_push_to_github, data)
+            
+            if result == "OK": 
+                await status.edit_text(f"✅ {bot_reply}\n\n<i>Успешно загружено на базу!</i>", parse_mode=ParseMode.HTML)
+            elif result == "DUPLICATE":
+                keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+                    [types.InlineKeyboardButton(text="✅ Добавить", callback_data="dup_yes")],
+                    [types.InlineKeyboardButton(text="❌ Отмена", callback_data="dup_no")]
+                ])
+                await state.update_data(tool_data=data)
+                await state.set_state(ToolForm.confirm_duplicate)
+                await status.edit_text(f"⚠️ Дубликат!", reply_markup=keyboard)
+            elif result == "MARKER_ERROR": 
+                await status.edit_text(f"❌ Нет метки HTML.")
+            else: 
+                await status.edit_text("❌ Сбой GitHub.")
+
+    except Exception as e:
+        logger.error(f"CRITICAL HANDLER ERROR: {e}")
+    finally:
+        gc.collect()
 
 # --- WEB SERVER ---
 async def health_check(request):
@@ -561,19 +550,19 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    safe_log(f"🌍 Web server started on port {port}")
+    logger.info(f"🌍 Web server started on port {port}")
 
 async def main():
-    safe_log("🚀 GALAXY INTELLIGENCE BOT ONLINE")
+    logger.info("🚀 GALAXY INTELLIGENCE BOT ONLINE")
     await start_web_server()
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Polling error: {e}")
 
 if __name__ == "__main__":
-    while True:
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            pass
-        except Exception:
-            time.sleep(5)
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped by user")
