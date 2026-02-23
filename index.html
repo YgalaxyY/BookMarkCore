@@ -201,6 +201,131 @@
             height: 300px;
         }
 
+        /* Стильные уведомления */
+        .notification {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: linear-gradient(135deg, rgba(147, 51, 234, 0.95), rgba(59, 130, 246, 0.95));
+            color: white;
+            padding: 16px 24px;
+            border-radius: 16px;
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3), 0 0 60px rgba(147, 51, 234, 0.2);
+            z-index: 9999;
+            transform: translateX(400px);
+            transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+            font-size: 14px;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .notification.show {
+            transform: translateX(0);
+        }
+
+        .notification::before {
+            content: '';
+            position: absolute;
+            inset: -1px;
+            border-radius: 17px;
+            padding: 2px;
+            background: linear-gradient(45deg, #9333ea, #3b82f6, #9333ea);
+            mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+            mask-composite: subtract;
+            animation: borderGlow 3s linear infinite;
+        }
+
+        @keyframes borderGlow {
+
+            0%,
+            100% {
+                opacity: 0.5;
+            }
+
+            50% {
+                opacity: 1;
+            }
+        }
+
+        /* Улучшенные иконки в Quick Stats */
+        .stat-icon {
+            transition: all 0.3s ease;
+            cursor: pointer;
+            position: relative;
+        }
+
+        .stat-icon:hover {
+            transform: translateY(-2px) scale(1.1);
+        }
+
+        .stat-icon::after {
+            content: '';
+            position: absolute;
+            inset: -4px;
+            border-radius: 12px;
+            background: inherit;
+            filter: blur(8px);
+            opacity: 0;
+            transition: opacity 0.3s;
+            z-index: -1;
+        }
+
+        .stat-icon:hover::after {
+            opacity: 0.6;
+        }
+
+        /* Анимированный футер */
+        .footer-content {
+            position: relative;
+            overflow: hidden;
+        }
+
+        .footer-content::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: -50%;
+            width: 200%;
+            height: 200%;
+            background: radial-gradient(circle, rgba(147, 51, 234, 0.1) 0%, transparent 70%);
+            animation: rotate 20s linear infinite;
+        }
+
+        @keyframes rotate {
+            from {
+                transform: rotate(0deg);
+            }
+
+            to {
+                transform: rotate(360deg);
+            }
+        }
+
+        .stars-text {
+            background: linear-gradient(90deg, #9333ea, #3b82f6, #10b981, #f59e0b, #ef4444);
+            background-size: 200% 100%;
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            animation: starsGradient 4s ease infinite;
+        }
+
+        @keyframes starsGradient {
+
+            0%,
+            100% {
+                background-position: 0% 50%;
+            }
+
+            50% {
+                background-position: 100% 50%;
+            }
+        }
+
         /* Адаптивность */
         @media (max-width: 1280px) {
             aside {
@@ -409,23 +534,27 @@
                                 class="w-10 h-10 bg-gradient-to-tr from-purple-600 to-blue-600 rounded-xl flex items-center justify-center">
                                 <i class="fas fa-meteor text-white"></i>
                             </div>
-                            <span class="font-semibold">Quick Stats</span>
+                            <span class="font-semibold"></span>
                         </div>
                         <div class="grid grid-cols-2 gap-4">
-                            <div class="text-center p-3 bg-white/5 rounded-xl">
-                                <div class="text-2xl font-bold text-purple-400">AI</div>
+                            <div class="text-center p-3 bg-white/5 rounded-xl cursor-pointer stat-icon"
+                                onclick="scrollToSection('ai')">
+                                <div class="text-2xl font-bold text-purple-400">🧠</div>
                                 <div class="text-xs text-gray-500">Intelligence</div>
                             </div>
-                            <div class="text-center p-3 bg-white/5 rounded-xl">
-                                <div class="text-2xl font-bold text-emerald-400">Dev</div>
+                            <div class="text-center p-3 bg-white/5 rounded-xl cursor-pointer stat-icon"
+                                onclick="scrollToSection('dev')">
+                                <div class="text-2xl font-bold text-emerald-400">💻</div>
                                 <div class="text-xs text-gray-500">Development</div>
                             </div>
-                            <div class="text-center p-3 bg-white/5 rounded-xl">
-                                <div class="text-2xl font-bold text-red-400">Sec</div>
+                            <div class="text-center p-3 bg-white/5 rounded-xl cursor-pointer stat-icon"
+                                onclick="scrollToSection('osint')">
+                                <div class="text-2xl font-bold text-red-400">🔒</div>
                                 <div class="text-xs text-gray-500">Security</div>
                             </div>
-                            <div class="text-center p-3 bg-white/5 rounded-xl">
-                                <div class="text-2xl font-bold text-pink-400">Life</div>
+                            <div class="text-center p-3 bg-white/5 rounded-xl cursor-pointer stat-icon"
+                                onclick="scrollToSection('fun')">
+                                <div class="text-2xl font-bold text-pink-400">🎮</div>
                                 <div class="text-xs text-gray-500">Lifestyle</div>
                             </div>
                         </div>
@@ -4416,8 +4545,12 @@
     </main>
 
     <!-- FOOTER -->
-    <footer class="border-t border-white/5 py-12 text-center text-gray-600 text-[10px] uppercase tracking-widest">
-        Galaxy OS
+    <footer
+        class="border-t border-white/5 py-12 text-center text-gray-600 text-[10px] uppercase tracking-widest relative overflow-hidden">
+        <div class="footer-content relative z-10">
+            <div class="stars-text font-bold mb-2">Galaxy OS</div>
+            <div class="text-xs opacity-70">Exploring the digital universe, one star at a time ✨</div>
+        </div>
     </footer>
 
     <script>
@@ -4444,25 +4577,51 @@
         document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
 
         // --- 3. УЛУЧШЕННЫЙ CLIPBOARD COPY ---
+        function showNotification(message, type = 'success') {
+            // Удаляем существующие уведомления
+            const existing = document.querySelector('.notification');
+            if (existing) existing.remove();
+
+            // Создаем новое уведомление
+            const notification = document.createElement('div');
+            notification.className = 'notification';
+            notification.innerHTML = `
+                <i class="fas fa-${type === 'success' ? 'check-circle' : 'copy'}"></i>
+                <span>${message}</span>
+            `;
+
+            document.body.appendChild(notification);
+
+            // Анимация появления
+            setTimeout(() => notification.classList.add('show'), 100);
+
+            // Автоматическое скрытие
+            setTimeout(() => {
+                notification.classList.remove('show');
+                setTimeout(() => notification.remove(), 400);
+            }, 3000);
+        }
+
         function copyToClipboard(id) {
             const el = document.getElementById(id);
             if (!el) return;
 
             const text = el.innerText;
             navigator.clipboard.writeText(text).then(() => {
-                // Визуальная обратная связь
-                const button = event.target.closest('button') || event.target;
-                const originalText = button.innerHTML;
-                button.innerHTML = '<i class="fas fa-check text-green-400"></i> Copied!';
-                button.classList.add('text-green-400');
-
-                setTimeout(() => {
-                    button.innerHTML = originalText;
-                    button.classList.remove('text-green-400');
-                }, 2000);
+                showNotification('Copied to clipboard!', 'success');
             }).catch(() => {
-                alert("Copied to clipboard!");
+                showNotification('Copied to clipboard!', 'copy');
             });
+        }
+
+        function scrollToSection(id) {
+            const section = document.getElementById(id);
+            if (section) {
+                section.scrollIntoView({
+                    behavior: 'smooth',
+                    block: 'start'
+                });
+            }
         }
 
         // --- 4. УЛУЧШЕННЫЙ ГЛОБАЛЬНЫЙ ПОИСК ---
