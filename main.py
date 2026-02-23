@@ -41,10 +41,10 @@ FILE_PATH = "index.html"
 
 # Каскад моделей
 AI_MODELS_QUEUE = [
-    "Qwen/Qwen2.5-72B-Instruct",             # Топ логика
-    "meta-llama/Llama-3.3-70B-Instruct",     # Мощная, но популярная
-    "meta-llama/Meta-Llama-3.1-8B-Instruct", # Быстрая
-    "mistralai/Mistral-Nemo-Instruct-2407"   # Резерв
+    "Qwen/Qwen2.5-72B-Instruct",
+    "meta-llama/Llama-3.3-70B-Instruct",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "mistralai/Mistral-Nemo-Instruct-2407"
 ]
 
 if not all([TG_TOKEN, GITHUB_TOKEN, HF_TOKEN]):
@@ -70,7 +70,7 @@ async def admin_middleware(handler, event: types.Message, data: dict):
     return await handler(event, data)
 
 
-# --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- 2. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И РАБОТА С БАЗОЙ ---
 
 def extract_url_from_text(text):
     urls = re.findall(r'(https?://[^\s<>")\]]+|www\.[^\s<>")\]]+)', text)
@@ -98,33 +98,58 @@ def clean_and_parse_json(raw_response):
     text = re.sub(r',\s*}', '}', text)
     text = re.sub(r',\s*]', ']', text)
 
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass 
-    try:
-        return ast.literal_eval(text)
-    except Exception:
-        return None
+    try: return json.loads(text)
+    except json.JSONDecodeError: pass 
+    try: return ast.literal_eval(text)
+    except Exception: return None
 
 def normalize_url(url):
-    """Умная очистка URL: убирает только UTM-метки, сохраняя важные параметры"""
-    if url in ["MISSING", "#", ""]: 
-        return url
+    if url in ["MISSING", "#", ""]: return url
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
-    # Фильтруем только рекламные метки, оставляем полезные (например v= для YouTube)
     clean_query = {k: v for k, v in query.items() if not k.startswith('utm_')}
     parsed = parsed._replace(query=urlencode(clean_query, doseq=True))
     return urlunparse(parsed).rstrip('/')
 
+def fetch_db_context():
+    """
+    Скачивает сайт с GitHub и превращает его в текстовую базу знаний для ИИ.
+    """
+    try:
+        repo = gh.get_repo(REPO_NAME)
+        contents = repo.get_contents(FILE_PATH, ref="main")
+        html_content = contents.decoded_content.decode("utf-8")
+        
+        card_blocks = html_content.split('class="glass-card')[1:]
+        db_items = []
+        
+        for block in card_blocks:
+            title_match = re.search(r'<h3[^>]*>(.*?)</h3>', block)
+            desc_match = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
+            xmp_match = re.search(r'<xmp>(.*?)</xmp>', block, re.DOTALL)
+            link_match = re.search(r'<a href="([^"]+)"', block)
+            
+            if title_match:
+                title = re.sub(r'<[^>]+>', '', title_match.group(1).strip())
+                desc = re.sub(r'<[^>]+>', '', desc_match.group(1).strip()) if desc_match else ""
+                
+                extra = ""
+                if xmp_match:
+                    extra = f"\n  Текст промпта: {xmp_match.group(1).strip()}"
+                elif link_match:
+                    extra = f"\n  Ссылка: {link_match.group(1)}"
+                    
+                db_items.append(f"Название: {title}\nОписание: {desc}{extra}\n---")
+                
+        return "\n".join(db_items) if db_items else "База данных пока пуста."
+    except Exception as e:
+        logger.error(f"Error fetching DB context: {e}")
+        return "Ошибка доступа к базе данных."
+
 # --- 3. МОЗГИ БОТА (ЭВРИСТИКА + ИИ) ---
 
 def fallback_heuristic_analysis(text):
-    """План Б: Если все нейросети лежат, анализируем текст сами"""
     logger.warning("🔧 AI Failed completely. Using Fallback logic.")
-    
-    # 1. Проверка на ПРОМПТ
     prompt_markers = [
         '<Role>', '<System>', '<Context>', '<Instructions>', '<Output_Format>',
         '<Роль>', '<Система>', '<Контекст>', '<Инструкции>', 
@@ -136,28 +161,19 @@ def fallback_heuristic_analysis(text):
         start_idx = len(text)
         for marker in prompt_markers:
             idx = text.find(marker)
-            if idx != -1 and idx < start_idx:
-                start_idx = idx
+            if idx != -1 and idx < start_idx: start_idx = idx
         
         prompt_body = text[start_idx:].strip() if start_idx < len(text) else text
-        
-        # Умный поиск заголовка
         lines = [line.strip() for line in text.split('\n') if len(line.strip()) > 10 and "http" not in line and "t.me" not in line]
         title = lines[0][:60] + "..." if lines else "AI Prompt"
 
         return {
-            "section": "prompts",
-            "name": title,
-            "desc": "System Prompt (Auto-detected)",
-            "url": "#",
-            "platform": "",
-            "prompt_body": prompt_body,
-            "confidence": 100,
-            "alternative": None,
+            "section": "prompts", "name": title, "desc": "System Prompt (Auto-detected)",
+            "url": "#", "platform": "", "prompt_body": prompt_body,
+            "confidence": 100, "alternative": None,
             "reply_text": "ИИ перегружен, но я сам распознал промпт! Сохраняю 📝"
         }
 
-    # 2. Проверка ссылок
     url = extract_url_from_text(text)
     lines = [line.strip() for line in text.split('\n') if len(line.strip()) > 5]
     title = lines[0][:50] + "..." if lines else "New Resource"
@@ -168,40 +184,34 @@ def fallback_heuristic_analysis(text):
     return {"section": "ideas", "name": title, "desc": text[:100]+"...", "url": url if url != "MISSING" else "#", "prompt_body": "", "confidence": 50, "alternative": None, "reply_text": "Нейросети недоступны, сохраняю как идею 💡"}
 
 async def analyze_content_full_cycle(text, status_msg: types.Message):
-    """
-    ГЛАВНЫЙ ЦИКЛ: Сначала ИИ, если падает -> Эвристика.
-    Включает Live-обновление UI в Телеграме.
-    """
     hard_found_url = extract_url_from_text(text)
     is_url_present = hard_found_url != "MISSING"
 
     system_prompt = (
         "### ROLE: Galaxy Intelligence Core (Charismatic AI Assistant)\n\n"
+        "### TASK: Analyze content and respond as a living assistant\n\n"
         "### CATEGORY LOGIC (Check strict order):\n"
         "1. 'osint' (SECURITY): Hacking, exploits, pentesting, privacy, leaks.\n"
-        "2. 'prompts' (TEXT INPUTS): The actual text meant to be typed into ChatGPT/Midjourney.\n"
-        "   *ACTION: Copy the prompt text to 'prompt_body'.*\n"
-        "3. 'sys' (SYSTEM): Windows/Linux tools, cleaners, ISOs, drivers, terminal commands.\n"
+        "2. 'prompts' (TEXT INPUTS): The actual text meant to be typed into ChatGPT.\n"
+        "3. 'sys' (SYSTEM): Windows/Linux tools, cleaners, drivers.\n"
         "4. 'apk' (MOBILE): Apps for Android/iOS.\n"
-        "5. 'study' (EDUCATION): Tutorials, research papers, slide creators, finding citations.\n"
-        "6. 'dev' (CODE): Libraries, APIs, Web-builders, VS Code, No-Code tools.\n"
+        "5. 'study' (EDUCATION): Tutorials, research, slide creators.\n"
+        "6. 'dev' (CODE): Libraries, APIs, Web-builders.\n"
         "7. 'shop' (COMMERCE): Goods, prices.\n"
-        "8. 'fun' (LEISURE): Games, movies, entertainment.\n"
-        "9. 'ai' (GENERAL AI): News, models, chatbots. (ONLY if not Study/Dev/Prompts).\n"
+        "8. 'fun' (LEISURE): Games, movies.\n"
+        "9. 'ai' (GENERAL AI): News, models. (If not Study/Dev/Prompts).\n"
         "10. 'prog' (SYNTAX): Code snippets.\n"
-        "11. 'ideas' (FALLBACK): General notes.\n\n"
-        "### CHAIN OF THOUGHT:\n"
-        "1. Analyze what the user sent\n"
-        "2. Choose the best category\n"
-        "3. Write a charismatic response with emojis\n\n"
+        "11. 'ideas' (FALLBACK): General notes.\n"
+        "12. 'chat' (CONVERSATION): User says 'Hello', 'Thanks', or asks a general question. ACTION: Do not save, just reply in 'reply_text'.\n\n"
+        "### CHAIN OF THOUGHT: First think, then answer!\n"
         "### OUTPUT JSON:\n"
         "{\n"
         "  \"thought_process\": \"Brief analysis...\",\n"
         "  \"section\": \"category\",\n"
         "  \"alternative\": \"alt_category_or_none\",\n"
         "  \"confidence\": 90,\n"
-        "  \"name\": \"Short English Title\",\n"
-        "  \"desc\": \"Summary in Russian\",\n"
+        "  \"name\": \"Title\",\n"
+        "  \"desc\": \"Summary\",\n"
         "  \"url\": \"Link or 'none'\",\n"
         "  \"platform\": \"Android/iOS/none\",\n"
         "  \"prompt_body\": \"Full prompt text or 'none'\",\n"
@@ -215,31 +225,21 @@ async def analyze_content_full_cycle(text, status_msg: types.Message):
     for model_name in AI_MODELS_QUEUE:
         short_model = model_name.split('/')[-1]
         try:
-            # Обновляем статус в ТГ
-            await status_msg.edit_text(f"🧠 <i>Анализирую через {short_model}...</i>", parse_mode=ParseMode.HTML)
-        except TelegramBadRequest:
-            pass # Игнорируем ошибку, если текст сообщения не изменился
+            await status_msg.edit_text(f"🧠 <i>Думаю через {short_model}...</i>", parse_mode=ParseMode.HTML)
+        except TelegramBadRequest: pass
 
-        logger.info(f"🤖 Asking: {model_name}...")
         try:
             client = InferenceClient(model=model_name, token=HF_TOKEN)
-            
-            # Таймаут 30 сек для тяжелых моделей
             response = await asyncio.wait_for(
                 asyncio.to_thread(
                     client.chat_completion,
                     messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-                    max_tokens=6000, # Увеличено для огромных промптов
-                    temperature=0.1
-                ),
-                timeout=30.0
+                    max_tokens=4000, temperature=0.1
+                ), timeout=25.0
             )
-            
-            content = response.choices[0].message.content.strip()
-            data = clean_and_parse_json(content)
+            data = clean_and_parse_json(response.choices[0].message.content.strip())
             
             if data:
-                logger.info(f"✅ Success: {model_name}")
                 ai_url = data.get('url', '')
                 if str(ai_url).lower() in ["none", "missing", "", "#"]:
                      data['url'] = hard_found_url if is_url_present else "#"
@@ -251,21 +251,13 @@ async def analyze_content_full_cycle(text, status_msg: types.Message):
                 return data
             
         except asyncio.TimeoutError:
-            logger.error(f"⏳ Timeout Error with {model_name}.")
-            try:
-                await status_msg.edit_text(f"⚠️ <i>{short_model} завис. Переключаюсь...</i>", parse_mode=ParseMode.HTML)
+            try: await status_msg.edit_text(f"⚠️ <i>{short_model} завис. Переключаюсь...</i>", parse_mode=ParseMode.HTML)
             except TelegramBadRequest: pass
             continue
-        except Exception as e:
-            logger.error(f"❌ Fail {model_name}: {e}")
+        except Exception:
             await asyncio.sleep(1)
             continue 
 
-    # Если все ИИ легли, вызываем эвристику
-    try:
-        await status_msg.edit_text("⚙️ <i>Нейросети недоступны. Запуск ручного алгоритма...</i>", parse_mode=ParseMode.HTML)
-    except TelegramBadRequest: pass
-    
     return fallback_heuristic_analysis(text)
 
 
@@ -279,17 +271,12 @@ def generate_card_html(data):
     platform = html.escape(str(data.get('platform', 'App')))
 
     meta = {
-        "ideas":  {"icon": "lightbulb",      "color": "yellow"},
-        "fun":    {"icon": "gamepad",        "color": "pink"},
-        "shop":   {"icon": "cart-shopping",  "color": "rose"},
-        "ai":     {"icon": "robot",          "color": "purple"},
-        "prompts":{"icon": "key",            "color": "amber"},
-        "study":  {"icon": "graduation-cap", "color": "indigo"},
-        "prog":   {"icon": "code",           "color": "blue"},
-        "dev":    {"icon": "flask",          "color": "emerald"},
-        "apk":    {"icon": "mobile-screen",  "color": "green"},
-        "sys":    {"icon": "microchip",      "color": "cyan"},
-        "osint":  {"icon": "eye",            "color": "red"},
+        "ideas":  {"icon": "lightbulb", "color": "yellow"}, "fun": {"icon": "gamepad", "color": "pink"},
+        "shop":   {"icon": "cart-shopping", "color": "rose"}, "ai": {"icon": "robot", "color": "purple"},
+        "prompts":{"icon": "key", "color": "amber"}, "study": {"icon": "graduation-cap", "color": "indigo"},
+        "prog":   {"icon": "code", "color": "blue"}, "dev": {"icon": "flask", "color": "emerald"},
+        "apk":    {"icon": "mobile-screen", "color": "green"}, "sys": {"icon": "microchip", "color": "cyan"},
+        "osint":  {"icon": "eye", "color": "red"},
     }
     style = meta.get(s, meta["ai"])
     color = style["color"]
@@ -324,18 +311,14 @@ def generate_card_html(data):
         return f"""
         <div class="glass-card p-8 rounded-[2rem] hover:bg-white/5 transition-all duration-300 reveal active border-t border-white/5 mb-6">
             <div class="flex items-start gap-4">
-                <div class="w-12 h-12 rounded-2xl bg-{color}-500/10 flex items-center justify-center shrink-0 border border-{color}-500/20">
-                    <i class="fas fa-{icon} text-{color}-400 text-lg"></i>
-                </div>
+                <div class="w-12 h-12 rounded-2xl bg-{color}-500/10 flex items-center justify-center shrink-0 border border-{color}-500/20"><i class="fas fa-{icon} text-{color}-400 text-lg"></i></div>
                 <div class="flex-1">
                     <div class="flex justify-between items-start">
                         <h3 class="text-lg font-bold text-gray-100 leading-tight mb-2">{name}</h3>
                         <span class="text-[9px] font-bold bg-{color}-500 text-black px-2 py-0.5 rounded uppercase tracking-wider">{platform}</span>
                     </div>
                     <p class="text-sm text-gray-400 leading-relaxed mb-4">{desc}</p>
-                    <a href="{url}" target="_blank" class="inline-flex items-center gap-2 text-xs font-bold text-white hover:text-{color}-400 transition-colors group">
-                        DOWNLOAD <i class="fas fa-download group-hover:translate-y-1 transition-transform"></i>
-                    </a>
+                    <a href="{url}" target="_blank" class="inline-flex items-center gap-2 text-xs font-bold text-white hover:text-{color}-400 transition-colors group">DOWNLOAD <i class="fas fa-download group-hover:translate-y-1 transition-transform"></i></a>
                 </div>
             </div>
         </div>
@@ -344,18 +327,14 @@ def generate_card_html(data):
     return f"""
     <div class="glass-card p-8 rounded-[2rem] hover:bg-white/5 transition-all duration-300 reveal active border-t border-white/5 mb-6">
         <div class="flex items-start gap-4">
-            <div class="w-12 h-12 rounded-2xl bg-{color}-500/10 flex items-center justify-center shrink-0 border border-{color}-500/20">
-                <i class="fas fa-{icon} text-{color}-400 text-lg"></i>
-            </div>
+            <div class="w-12 h-12 rounded-2xl bg-{color}-500/10 flex items-center justify-center shrink-0 border border-{color}-500/20"><i class="fas fa-{icon} text-{color}-400 text-lg"></i></div>
             <div class="flex-1">
                 <div class="flex justify-between items-start">
                     <h3 class="text-lg font-bold text-gray-100 leading-tight mb-2">{name}</h3>
                     <span class="text-[9px] font-bold bg-{color}-500/20 text-{color}-300 px-2 py-1 rounded uppercase tracking-wider">{s}</span>
                 </div>
                 <p class="text-sm text-gray-400 leading-relaxed mb-4">{desc}</p>
-                <a href="{url}" target="_blank" class="inline-flex items-center gap-2 text-xs font-bold text-white hover:text-{color}-400 transition-colors group">
-                    OPEN RESOURCE <i class="fas fa-arrow-right group-hover:translate-x-1 transition-transform"></i>
-                </a>
+                <a href="{url}" target="_blank" class="inline-flex items-center gap-2 text-xs font-bold text-white hover:text-{color}-400 transition-colors group">OPEN RESOURCE <i class="fas fa-arrow-right group-hover:translate-x-1 transition-transform"></i></a>
             </div>
         </div>
     </div>
@@ -374,47 +353,81 @@ def sync_push_to_github(data, force=False):
         clean_target = normalize_url(target_url)
         
         if not force and clean_target and clean_target not in ["#", "MISSING", ""]:
-            if clean_target in html_content:
-                logger.info(f"Duplicate found: {clean_target}")
-                return "DUPLICATE"
+            if clean_target in html_content: return "DUPLICATE"
             name = html.escape(str(data.get('name', '')))
-            if name and name in html_content:
-                logger.info(f"Duplicate by name found: {name}")
-                return "DUPLICATE"
+            if name and name in html_content: return "DUPLICATE"
 
         sec_key = str(data.get('section', 'ai')).upper()
         target_marker = f"<!-- INSERT_{sec_key}_HERE -->"
-        
-        if target_marker not in html_content:
-            return "MARKER_ERROR"
+        if target_marker not in html_content: return "MARKER_ERROR"
 
         new_card = generate_card_html(data)
         new_html = html_content.replace(target_marker, f"{new_card}\n{target_marker}")
 
-        commit_msg = f"Add: {data.get('name')} [{sec_key}] via GalaxyBot"
-        repo.update_file(contents.path, commit_msg, new_html, contents.sha, branch)
+        repo.update_file(contents.path, f"Add: {data.get('name')} [{sec_key}] via GalaxyBot", new_html, contents.sha, branch)
         return "OK"
     except Exception as e:
-        logger.error(f"GitHub Push Error: {e}")
         return "GIT_ERROR"
 
 
 # --- 6. TELEGRAM HANDLERS ---
 
+# --- НОВАЯ ФИЧА: ПОИСК ПО БАЗЕ ---
+@dp.message(F.text.startswith('/ask') | F.text.startswith('?'))
+async def ask_database_handler(message: types.Message):
+    query = message.text.replace('/ask', '').lstrip('?').strip()
+    if not query:
+        await message.reply("📝 Напиши вопрос, например:\n`? найди нейросеть для презентаций`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    status_msg = await message.answer("🔍 <i>Ищу ответ в твоей базе знаний...</i>", parse_mode=ParseMode.HTML)
+    
+    # 1. Достаем базу знаний с сайта
+    db_context = await asyncio.to_thread(fetch_db_context)
+    
+    system_prompt = (
+        "Ты — Galaxy OS Assistant, личный ИИ-помощник создателя.\n"
+        "Твоя задача — находить нужные инструменты и промпты в ЕГО личной базе знаний.\n\n"
+        "БАЗА ЗНАНИЙ СОЗДАТЕЛЯ:\n"
+        f"{db_context}\n\n"
+        "ИНСТРУКЦИИ:\n"
+        "1. Внимательно изучи базу знаний.\n"
+        "2. Ответь на вопрос пользователя, основываясь ТОЛЬКО на этих данных.\n"
+        "3. Если пользователь ищет промпт, скопируй ему полный текст промпта.\n"
+        "4. Если ищет сервис, дай название, описание и ссылку.\n"
+        "5. Если в базе нет ответа, так и скажи: 'К сожалению, в базе пока нет такого инструмента'.\n"
+        "6. Будь харизматичным и используй эмодзи."
+    )
+    
+    try:
+        client = InferenceClient(model=AI_MODELS_QUEUE[0], token=HF_TOKEN)
+        response = await asyncio.wait_for(
+            asyncio.to_thread(
+                client.chat_completion,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": query}],
+                max_tokens=3000, temperature=0.3
+            ), timeout=30.0
+        )
+        answer = response.choices[0].message.content.strip()
+        # Выводим ответ (без ParseMode, чтобы не сломать разметку промптов)
+        await status_msg.edit_text(answer)
+    except Exception as e:
+        logger.error(f"Ask Error: {e}")
+        await status_msg.edit_text("❌ Ошибка при поиске в базе. Сервер перегружен.")
+
+# ... (Остальные хендлеры: process_category_selection, process_duplicate_decision, manual_link_handler остаются как были) ...
 @dp.callback_query(F.data.startswith("cat_"), ToolForm.select_category)
 async def process_category_selection(callback: types.CallbackQuery, state: FSMContext):
     selected_cat = callback.data.split("_")[1]
     state_data = await state.get_data()
     tool_data = state_data.get('tool_data')
-    
     if not tool_data:
         await callback.message.edit_text("❌ Данные устарели.")
         await state.clear()
         return
-
     tool_data['section'] = selected_cat
     await callback.message.edit_text(f"👌 Выбрано: **{selected_cat.upper()}**. Деплою...")
-    
     result = await asyncio.to_thread(sync_push_to_github, tool_data)
     if result == "OK": await callback.message.edit_text(f"✅ Добавлено в `{selected_cat.upper()}`!")
     else: await callback.message.edit_text(f"❌ Ошибка (код: {result}).")
@@ -428,7 +441,6 @@ async def process_duplicate_decision(callback: types.CallbackQuery, state: FSMCo
         await callback.message.edit_text("❌ Данные устарели.")
         await state.clear()
         return
-
     if callback.data == "dup_no":
         await callback.message.edit_text("🙅‍♂️ Отмена.")
         await state.clear()
@@ -446,14 +458,11 @@ async def manual_link_handler(message: types.Message, state: FSMContext):
         await message.answer("❌ Данные потеряны (Бот перезагрузился).")
         await state.clear()
         return
-
     user_link = message.text.strip()
     tool_data = state_data['tool_data']
     tool_data['url'] = "#" if user_link == "#" else user_link
-
     status = await message.answer(f"🔗 Ссылка принята. Деплою **{tool_data['name']}**...")
     result = await asyncio.to_thread(sync_push_to_github, tool_data)
-    
     if result == "OK":
         await status.edit_text(f"✅ **{tool_data['name']}** успешно добавлен!")
         await state.clear()
@@ -474,18 +483,15 @@ async def main_content_handler(message: types.Message, state: FSMContext):
     try:
         content = message.text or message.caption or ""
         
-        # Защита от "голых" ссылок
         if re.match(r'^https?://\S+$', content.strip()):
             await message.reply("⚠️ Это просто ссылка. Если это дополнение к посту, то я потерял контекст. Пожалуйста, отправь пост целиком.")
             return
 
         if len(content.strip()) < 5: return
 
-        # Live UX: Показываем статус работы
         await bot.send_chat_action(chat_id=message.chat.id, action="typing")
         status_msg = await message.answer("🌌 <i>Инициализация сканирования...</i>", parse_mode=ParseMode.HTML)
         
-        # Передаем status_msg внутрь для живого обновления текста
         data = await analyze_content_full_cycle(content, status_msg)
 
         if not data:
@@ -493,13 +499,19 @@ async def main_content_handler(message: types.Message, state: FSMContext):
             return
 
         section = str(data.get('section', 'ai')).lower()
+        bot_reply = data.get('reply_text', f"🚀 Готовлю деплой {data.get('name', 'Unknown')}...")
+        
+        # --- НОВАЯ ФИЧА: ОБЫЧНЫЙ ЧАТ ---
+        # Если ИИ понял, что это просто разговор или вопрос без тега /ask
+        if section == 'chat':
+            await status_msg.edit_text(f"💬 {bot_reply}\n\n<i>💡 P.S. Если хочешь найти что-то в сохраненной базе, используй команду <b>/ask [твой вопрос]</b> или начни сообщение с вопроса (?).</i>", parse_mode=ParseMode.HTML)
+            return
+
         confidence = data.get('confidence', 100)
         alt_section = data.get('alternative')
         name = data.get('name', 'Unknown')
         url = str(data.get('url', ''))
-        bot_reply = data.get('reply_text', f"🚀 Готовлю деплой {name}...")
         
-        # Сомнения
         if confidence < 80 and alt_section and alt_section != section:
             keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
                 [
