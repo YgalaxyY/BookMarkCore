@@ -82,15 +82,115 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         .custom-select-options::-webkit-scrollbar { width: 4px; }
         .custom-select-options::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+        .custom-select-icon {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 18px;
+            height: 18px;
+            border-radius: 6px;
+            background: rgba(168, 85, 247, 0.15);
+            color: #c4b5fd;
+            font-size: 10px;
+            margin-right: 8px;
+        }
+        .custom-select-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .custom-tooltip {
+            position: relative;
+        }
+        .custom-tooltip::after {
+            content: attr(data-tooltip);
+            position: absolute;
+            bottom: calc(100% + 10px);
+            left: 0;
+            background: rgba(15, 15, 20, 0.95);
+            color: #e2e8f0;
+            padding: 8px 10px;
+            border-radius: 10px;
+            font-size: 11px;
+            white-space: nowrap;
+            opacity: 0;
+            visibility: hidden;
+            transform: translateY(6px);
+            transition: all 0.2s ease;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35);
+            z-index: 200;
+        }
+        .custom-tooltip:hover::after {
+            opacity: 1;
+            visibility: visible;
+            transform: translateY(0);
+        }
+        .section-group {
+            margin-top: 20px;
+        }
+        .section-group-title {
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: #94a3b8;
+            margin-bottom: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .section-group-title::before {
+            content: '';
+            width: 18px;
+            height: 2px;
+            background: linear-gradient(90deg, #9333ea, transparent);
+            border-radius: 4px;
+        }
+        .empty-state {
+            background: rgba(15, 15, 20, 0.6);
+            border: 1px dashed rgba(255, 255, 255, 0.12);
+            border-radius: 20px;
+            padding: 28px;
+            text-align: center;
+            color: #cbd5e1;
+            backdrop-filter: blur(12px);
+        }
+        .empty-state h4 {
+            font-size: 16px;
+            font-weight: 700;
+            color: #f1f5f9;
+            margin-bottom: 6px;
+        }
+        .empty-state p {
+            font-size: 12px;
+            color: #94a3b8;
+        }
+        .empty-state button {
+            margin-top: 12px;
+            padding: 8px 14px;
+            border-radius: 12px;
+            background: rgba(168, 85, 247, 0.2);
+            color: #e9d5ff;
+            border: 1px solid rgba(168, 85, 247, 0.3);
+            font-size: 12px;
+        }
     `;
     document.head.appendChild(style);
 
+    const FACET_META = {
+        format: { label: 'Формат', icon: 'fa-layer-group', tooltip: 'Тип и формат ресурса' },
+        focus: { label: 'Направление', icon: 'fa-compass', tooltip: 'Сфера применения и задача' },
+        platform: { label: 'Платформа', icon: 'fa-mobile-screen-button', tooltip: 'ОС или среда использования' },
+        source: { label: 'Источник', icon: 'fa-globe', tooltip: 'Где размещен ресурс' },
+        model: { label: 'Модель', icon: 'fa-brain', tooltip: 'Модель или семейство ИИ' }
+    };
+
     const FACET_DEFINITIONS = [
-        { key: 'format', label: '', detector: detectFormat },
-        { key: 'focus', label: '', detector: detectFocus },
-        { key: 'platform', label: '', detector: detectPlatform },
-        { key: 'source', label: '', detector: detectSource },
-        { key: 'model', label: '', detector: detectModel }
+        { key: 'format', detector: detectFormat },
+        { key: 'focus', detector: detectFocus },
+        { key: 'platform', detector: detectPlatform },
+        { key: 'source', detector: detectSource },
+        { key: 'model', detector: detectModel }
     ];
 
     class AdvancedSectionFilter {
@@ -102,15 +202,25 @@ document.addEventListener('DOMContentLoaded', () => {
             this.resources = [];
             this.activeFilters = {};
             this.searchTerm = '';
+            this.groupMap = new Map();
+            this.emptyStateEl = null;
             this.init();
         }
 
         init() {
             this.extractResources();
-            if (this.resources.length === 0) return;
+            if (this.resources.length === 0) {
+                this.renderEmptyState('Пока нет ресурсов', 'Добавьте первый ресурс, и он появится здесь.');
+                return;
+            }
             const availableFacets = this.analyzeFacets();
-            if (availableFacets.length === 0) return;
+            if (availableFacets.length === 0) {
+                this.createUI([]);
+                this.applyGrouping();
+                return;
+            }
             this.createUI(availableFacets);
+            this.applyGrouping();
         }
 
         extractResources() {
@@ -161,7 +271,8 @@ document.addEventListener('DOMContentLoaded', () => {
                         .sort((a, b) => b[1] - a[1])
                         .slice(0, MAX_OPTIONS_PER_FACET)
                         .map(([val]) => val);
-                    return { key: f.def.key, label: f.def.label, options };
+                    const meta = FACET_META[f.def.key] || { label: f.def.key, icon: 'fa-filter', tooltip: '' };
+                    return { key: f.def.key, label: meta.label, icon: meta.icon, tooltip: meta.tooltip, options };
                 });
 
             return usable;
@@ -205,18 +316,26 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             this.bindEvents(filterBar);
+            this.emptyStateEl = this.createEmptyStateElement();
         }
 
         createCustomDropdownHTML(facet) {
+            const label = facet.label || 'Фильтр';
+            const defaultLabel = `${label}: Все`;
             const optionsHTML = facet.options.map(v => `<div class="custom-option" data-value="${v}">${v}</div>`).join('');
+            const tooltip = facet.tooltip || '';
+            const icon = facet.icon || 'fa-filter';
             return `
-                <div class="custom-select-container" data-facet="${facet.key}">
-                    <div class="custom-select-trigger">
-                        <span>${facet.label}</span>
+                <div class="custom-select-container" data-facet="${facet.key}" data-default-label="${defaultLabel}">
+                    <div class="custom-select-trigger custom-tooltip" data-tooltip="${tooltip}">
+                        <span class="custom-select-label">
+                            <span class="custom-select-icon"><i class="fas ${icon}"></i></span>
+                            <span>${defaultLabel}</span>
+                        </span>
                         <i class="fas fa-chevron-down text-[10px] ml-2 opacity-50"></i>
                     </div>
                     <div class="custom-select-options custom-scrollbar">
-                        <div class="custom-option selected" data-value="all">Все ${facet.label}</div>
+                        <div class="custom-option selected" data-value="all">${defaultLabel}</div>
                         ${optionsHTML}
                     </div>
                 </div>
@@ -241,8 +360,8 @@ document.addEventListener('DOMContentLoaded', () => {
             dropdowns.forEach(dropdown => {
                 const trigger = dropdown.querySelector('.custom-select-trigger');
                 const facet = dropdown.dataset.facet;
-                const triggerSpan = trigger.querySelector('span');
-                const facetLabel = dropdown.querySelector('.custom-option[data-value="all"]')?.innerText.replace(/^Все\s/, '') || '';
+                const triggerSpan = trigger.querySelector('.custom-select-label span:last-child');
+                const facetLabel = dropdown.dataset.defaultLabel || 'Все';
 
                 trigger.addEventListener('click', e => {
                     e.stopPropagation();
@@ -279,8 +398,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 this.searchTerm = '';
                 searchInput.value = '';
                 dropdowns.forEach(d => {
-                    const label = d.querySelector('.custom-option[data-value="all"]')?.innerText.replace(/^Все\s/, '') || '';
-                    d.querySelector('.custom-select-trigger span').innerText = label;
+                    const label = d.dataset.defaultLabel || 'Все';
+                    d.querySelector('.custom-select-label span:last-child').innerText = label;
                     d.querySelector('.custom-select-trigger').classList.remove('active');
                     d.querySelectorAll('.custom-option').forEach(o => o.classList.remove('selected'));
                     d.querySelector('.custom-option[data-value="all"]').classList.add('selected');
@@ -291,6 +410,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         applyFilters() {
+            let visibleCount = 0;
             this.resources.forEach(res => {
                 const matchesSearch = this.searchTerm === '' || res.fullText.includes(this.searchTerm);
                 let matchesFacets = true;
@@ -304,11 +424,83 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (matchesSearch && matchesFacets) {
                     res.element.style.display = 'block';
                     requestAnimationFrame(() => res.element.classList.add('active'));
+                    visibleCount += 1;
                 } else {
                     res.element.style.display = 'none';
                     res.element.classList.remove('active');
                 }
             });
+            this.updateGroupVisibility();
+            this.toggleEmptyState(visibleCount === 0);
+        }
+
+        applyGrouping() {
+            const grid = this.sectionElement.querySelector('.grid');
+            if (!grid) return;
+            const groupKey = 'format';
+            const groups = new Map();
+
+            this.resources.forEach(res => {
+                const values = res.facets[groupKey] || [];
+                const label = values.length > 0 ? values[0] : 'Другое';
+                if (!groups.has(label)) {
+                    const groupEl = document.createElement('div');
+                    groupEl.className = 'section-group';
+                    groupEl.dataset.group = label;
+                    groupEl.innerHTML = `
+                        <div class="section-group-title">${label}</div>
+                        <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6"></div>
+                    `;
+                    groups.set(label, groupEl);
+                }
+                groups.get(label).querySelector('.grid').appendChild(res.element);
+            });
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'section-groups';
+            Array.from(groups.entries()).sort((a, b) => a[0].localeCompare(b[0])).forEach(([_, el]) => wrapper.appendChild(el));
+            grid.replaceWith(wrapper);
+            this.groupMap = groups;
+        }
+
+        updateGroupVisibility() {
+            if (!this.groupMap || this.groupMap.size === 0) return;
+            this.groupMap.forEach(groupEl => {
+                const cards = groupEl.querySelectorAll('.glass-card');
+                const anyVisible = Array.from(cards).some(card => card.style.display !== 'none');
+                groupEl.style.display = anyVisible ? 'block' : 'none';
+            });
+        }
+
+        createEmptyStateElement() {
+            let el = this.sectionElement.querySelector('.empty-state');
+            if (el) return el;
+            el = document.createElement('div');
+            el.className = 'empty-state';
+            el.innerHTML = `
+                <h4>Пока пусто</h4>
+                <p>Добавьте новые ресурсы — они появятся здесь автоматически.</p>
+                <button type="button">Добавить ресурс</button>
+            `;
+            const target = this.sectionElement.querySelector('.section-groups') || this.sectionElement.querySelector('.grid');
+            if (target) target.before(el);
+            else this.sectionElement.appendChild(el);
+            el.style.display = 'none';
+            return el;
+        }
+
+        renderEmptyState(title, subtitle) {
+            this.createEmptyStateElement();
+            if (this.emptyStateEl) {
+                this.emptyStateEl.querySelector('h4').innerText = title;
+                this.emptyStateEl.querySelector('p').innerText = subtitle;
+                this.emptyStateEl.style.display = 'block';
+            }
+        }
+
+        toggleEmptyState(show) {
+            if (!this.emptyStateEl) return;
+            this.emptyStateEl.style.display = show ? 'block' : 'none';
         }
     }
 
